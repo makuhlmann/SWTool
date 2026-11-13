@@ -179,21 +179,57 @@ namespace SWTool
             return response.Ok ? Parsers.ParseScan(response.Text) : new List<NetworkEntry>();
         }
 
-        /// <summary>Manual registration on a PLMN, optionally forcing the access technology.</summary>
-        public AtResponse Register(string plmn, int act)
+        /// <summary>A network that accepts the SIM answers within seconds; a refused attempt never answers at all.</summary>
+        private const int RegisterTimeoutMs = 100000;
+
+        /// <summary>
+        /// Manual registration on a PLMN, optionally locking the modem to one access technology.
+        /// </summary>
+        /// <remarks>
+        /// Always done in two steps because of how the EM7455 firmware treats AT+COPS:
+        /// "AT+COPS=1,2,plmn,act" sets the network type preference (!SELRAT) to that type only, and while
+        /// the preference is already locked to a type, naming that type again for another network is
+        /// answered with "registration denied" and the command hangs. Without a type the command works
+        /// from any state and resets the preference to Automatic, so the operator is selected first and
+        /// the type is locked afterwards, on the network the modem is then already registered on.
+        /// </remarks>
+        public RegisterResult Register(string plmn, int act, bool lockType)
         {
+            RegisterResult res = new RegisterResult();
+            AtResponse r = At.Send("AT+COPS=1,2,\"" + plmn + "\"", RegisterTimeoutMs);
+            res.Response = r;
+            if (r.TimedOut) AbortPending();
+            res.OperatorSelected = r.Ok;
+
             // Send the canonical access technology (HSPA variants are selected as UTRAN).
             int a = act == 7 ? 7 : (act == 2 || (act >= 4 && act <= 6)) ? 2 : act >= 0 ? 0 : -1;
-            string cmd = "AT+COPS=1,2,\"" + plmn + "\"" + (a >= 0 ? "," + a : "");
-            AtResponse r = At.Send(cmd, 150000);
+            if (r.Ok && lockType && a >= 0)
+            {
+                res.LockRequested = true;
+                r = At.Send("AT+COPS=1,2,\"" + plmn + "\"," + a, RegisterTimeoutMs);
+                res.Response = r;
+                if (r.TimedOut) AbortPending();
+                res.TypeLocked = r.Ok;
+            }
+
             At.Send("AT+COPS=3,0", 3000, true);
             InvalidateSlowItems();
-            return r;
+            return res;
+        }
+
+        /// <summary>
+        /// Cancels a +COPS command that is still waiting for the network. Any input aborts it, and the
+        /// modem then returns to the network and preference it had before.
+        /// </summary>
+        private void AbortPending()
+        {
+            At.Send("AT", 5000, true);
         }
 
         public AtResponse RegisterAutomatic()
         {
-            AtResponse r = At.Send("AT+COPS=0", 150000);
+            AtResponse r = At.Send("AT+COPS=0", RegisterTimeoutMs);
+            if (r.TimedOut) AbortPending();
             At.Send("AT+COPS=3,0", 3000, true);
             InvalidateSlowItems();
             return r;

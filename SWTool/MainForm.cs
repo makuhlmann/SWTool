@@ -33,7 +33,8 @@ namespace SWTool
         private BufferedListView cellList, neighbourList, detailList, networkList;
         private HistoryChart chart;
         private TextBox consoleOut, consoleIn;
-        private CheckBox showPolling;
+        private CheckBox showPolling, lockType;
+        private Font boldListFont;
         private ToolStripStatusLabel statusLabel, updatedLabel;
 
         public MainForm()
@@ -296,7 +297,14 @@ namespace SWTool
             registerButton = MakeButton("Register on selected network", OnRegisterClick);
             autoButton = MakeButton("Automatic selection", OnAutomaticClick);
             selectionLabel = MakeLabel("");
+            lockType = new CheckBox();
+            lockType.Text = "Lock to its network type";
+            lockType.AutoSize = true;
+            lockType.Checked = true;
+            lockType.Margin = new Padding(4, 7, 10, 3);
+            lockType.CheckedChanged += delegate { SaveSetting("LockType", lockType.Checked ? "1" : "0"); };
             actions.Controls.Add(registerButton);
+            actions.Controls.Add(lockType);
             actions.Controls.Add(autoButton);
             actions.Controls.Add(selectionLabel);
 
@@ -426,6 +434,7 @@ namespace SWTool
                     {
                         currentPort = k.GetValue("Port") as string;
                         int.TryParse(k.GetValue("IntervalMs") as string, out ms);
+                        lockType.Checked = (k.GetValue("LockType") as string) != "0";
                     }
                 }
             }
@@ -617,6 +626,7 @@ namespace SWTool
             scanButton.Enabled = idle;
             autoButton.Enabled = idle;
             registerButton.Enabled = idle && networkList.SelectedItems.Count == 1;
+            lockType.Enabled = idle;
             ratCombo.Enabled = idle && ratCombo.Items.Count > 0;
             bandCombo.Enabled = idle && bandCombo.Items.Count > 0;
             ratApply.Enabled = idle && ratCombo.SelectedItem != null;
@@ -834,8 +844,9 @@ namespace SWTool
             ShowDetails(s);
 
             // ---- networks page
-            selectionLabel.Text = "Current: " + SelectionText(s)
-                + (string.IsNullOrEmpty(s.OperatorName) ? "" : ", registered on " + s.OperatorName);
+            selectionLabel.Text = (string.IsNullOrEmpty(s.OperatorName) || !s.Registered ? "" : s.OperatorName + "  -  ")
+                + SelectionText(s);
+            MarkCurrentNetwork();
             SyncChoice(ratCombo, s.RatPrefIndex, ref shownRat);
             SyncChoice(bandCombo, s.BandPrefIndex, ref shownBand);
 
@@ -1041,12 +1052,33 @@ namespace SWTool
                 ListViewItem it = new ListViewItem(new[] { n.LongName, n.ShortName, Parsers.FormatPlmn(n.Plmn), tech, n.StatText });
                 it.Tag = n;
                 it.Group = groups[tech];
-                if (n.Stat == 2) it.Font = new Font(networkList.Font, FontStyle.Bold);
-                else if (n.Stat == 3) it.ForeColor = Color.FromArgb(0x99, 0x99, 0x99);
+                if (n.Stat == 3) it.ForeColor = Color.FromArgb(0x99, 0x99, 0x99);
                 networkList.Items.Add(it);
             }
+            MarkCurrentNetwork();
             networkList.EndUpdate();
             UpdateEnabled();
+        }
+
+        /// <summary>
+        /// Shows which search result the modem is registered on right now. The search itself does not
+        /// always flag it, and the answer changes after a registration without a new search.
+        /// </summary>
+        private void MarkCurrentNetwork()
+        {
+            ModemStatus s = status;
+            string tech = s == null ? null : s.IsLte ? "LTE (4G)" : s.IsWcdma ? "UMTS (3G)" : s.IsGsm ? "GSM (2G)" : null;
+            bool known = s != null && s.Registered && !string.IsNullOrEmpty(s.Plmn) && tech != null;
+            foreach (ListViewItem it in networkList.Items)
+            {
+                NetworkEntry n = it.Tag as NetworkEntry;
+                if (n == null) continue;
+                bool current = known ? n.Plmn == s.Plmn && Parsers.AccessTechnology(n.Act) == tech : n.Stat == 2;
+                string text = current ? "Current" : n.Stat == 2 ? "Available" : n.StatText;
+                if (it.SubItems[4].Text != text) it.SubItems[4].Text = text;
+                if (it.Font.Bold != current)
+                    it.Font = current ? (boldListFont ?? (boldListFont = new Font(networkList.Font, FontStyle.Bold))) : networkList.Font;
+            }
         }
 
         private static int StatOrder(int stat)
@@ -1060,24 +1092,58 @@ namespace SWTool
             NetworkEntry n = networkList.SelectedItems[0].Tag as NetworkEntry;
             if (n == null) return;
             string tech = Parsers.AccessTechnology(n.Act);
-            string what = n.LongName + " (" + Parsers.FormatPlmn(n.Plmn) + ")" + (n.Act >= 0 ? " using " + tech : "");
+            bool wantLock = lockType.Checked && n.Act >= 0;
+            string what = n.LongName + " (" + Parsers.FormatPlmn(n.Plmn) + ")";
 
-            string question = "Register manually on " + what + "?\n\n"
-                + "The modem stays on this network until you choose another one or switch back to automatic selection.";
-            if (n.Act >= 0)
+            // On the EM7455 a manual registration always rewrites the network type preference (!SELRAT):
+            // to the named type only, or to Automatic when no type is named. Say so before doing it.
+            string question = "Register manually on " + what + (wantLock ? " using " + tech + " only" : "") + "?\n\n"
+                + "The modem stays on this network until you choose another one or switch back to automatic selection.\n\n";
+            if (wantLock)
             {
-                // Observed on the EM7455: AT+COPS with an access technology also rewrites the !SELRAT preference.
-                question += "\n\nThis also changes the modem's network type preference to " + tech + " only. "
-                    + "It will not fall back to another network type until you change that preference again "
-                    + "(\"Network type\" below).";
+                question += "The modem's network type preference becomes \"" + tech + " only\". It will not fall back to "
+                    + "another network type until you change that preference (\"Network type\" below).";
+            }
+            else
+            {
+                question += "The modem picks the network type on this operator itself: its network type preference "
+                    + "is reset to \"Automatic\".";
             }
             question += "\n\nThe data connection is briefly interrupted and usually comes back with a new IP address.";
             if (n.Stat == 3) question += "\n\nThis network is marked as forbidden for your SIM card, so the registration will probably be rejected.";
             if (MessageBox.Show(this, question, "Change network", MessageBoxButtons.OKCancel,
                 n.Stat == 3 ? MessageBoxIcon.Warning : MessageBoxIcon.Question) != DialogResult.OK) return;
 
-            await RunCommand("Registering on " + n.LongName + "...", delegate { return modem.Register(n.Plmn, n.Act); },
-                "The modem could not register on " + what + ".");
+            RegisterResult res;
+            try
+            {
+                res = await RunBusy("Registering on " + n.LongName + "...",
+                    delegate { return modem.Register(n.Plmn, n.Act, wantLock); });
+            }
+            catch (Exception ex)
+            {
+                if (!closing) ConnectionLost(ex);
+                return;
+            }
+            if (closing) return;
+
+            if (res.Success)
+            {
+                SetStatus("Registered on " + n.LongName + (res.TypeLocked ? ", locked to " + tech : ""));
+                return;
+            }
+
+            // A network that refuses the SIM never answers the command; it is then cancelled by the modem layer.
+            string reason = res.Response.TimedOut
+                ? "The network did not accept the registration in time, which usually means that roaming is not permitted "
+                    + "there for this SIM card."
+                : "Modem response: " + res.Response.Result;
+            string message = res.OperatorSelected
+                ? "The modem is registered on " + what + ", but it could not be locked to " + tech + ".\n\n" + reason
+                    + "\n\nIt now uses whichever network type this operator offers (preference \"Automatic\")."
+                : "The modem could not register on " + what + ".\n\n" + reason
+                    + (res.Response.TimedOut ? "\n\nThe attempt was cancelled and the modem returns to the previous network." : "");
+            MessageBox.Show(this, message, "SWTool", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
 
         private async void OnAutomaticClick(object sender, EventArgs e)

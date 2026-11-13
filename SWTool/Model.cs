@@ -47,6 +47,18 @@ namespace SWTool
         }
     }
 
+    /// <summary>Outcome of a manual registration, which runs as "select operator" plus an optional "lock type".</summary>
+    public sealed class RegisterResult
+    {
+        /// <summary>Response of the last command that was sent.</summary>
+        public AtResponse Response;
+        public bool OperatorSelected;
+        public bool LockRequested;
+        public bool TypeLocked;
+
+        public bool Success { get { return OperatorSelected && (!LockRequested || TypeLocked); } }
+    }
+
     /// <summary>An entry of an index/name list such as AT!SELRAT=? or AT!BAND=?.</summary>
     public sealed class Choice
     {

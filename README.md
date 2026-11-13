@@ -29,9 +29,14 @@ The result is `SWTool\bin\Release\SWTool.exe`, a single file with no dependencie
   can have it open at a time. The card keeps working through Windows (MBIM) while SWTool is connected.
 - A network search takes 30 seconds to 2 minutes and can pause data transfer. Disconnect aborts it; the modem
   may then need a few seconds before it answers again.
-- Registering on a network with a given type (`AT+COPS=1,2,"plmn",act`) also sets the modem's network type
-  preference to that type only (seen on the EM7455: "UMTS and LTE Only" became "LTE Only"). Widen it again
-  with the "Network type" preference on the Networks tab.
+- A manual registration always rewrites the modem's network type preference (seen on the EM7455):
+  `AT+COPS=1,2,"plmn",act` sets it to that type only, `AT+COPS=1,2,"plmn"` resets it to Automatic.
+  "Lock to its network type" chooses between the two; the "Network type" preference changes it afterwards.
+- Firmware quirk: while the preference is locked to one type, naming that type again for a *different*
+  network is answered with "registration denied" and the command never returns. SWTool therefore always
+  selects the operator first without a type and locks the type in a second step.
+- A network that refuses the SIM never answers the registration command. SWTool cancels the attempt after
+  100 seconds; the modem then returns to the network it was on.
 - Manual registration, the network type preference and the band preference are stored in the modem and stay
   in effect after the tool is closed. Setting the two preferences sends Sierra's `AT!ENTERCND="A710"` unlock
   first.
