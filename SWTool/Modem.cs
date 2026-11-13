@@ -25,6 +25,18 @@ namespace SWTool
         private int tick;
         private string iceraDomain;
         private string typeCommand = "WS46"; // how a plain Qualcomm modem sets its network type: MODODR, SYSCONFIG or WS46
+        private bool bandCommands;           // it has +BNDPRF and +NVRW, so its bands can be switched
+        private ulong gwMask, lteMask;       // bands enabled now (2G/3G band preference, LTE NV item 6828)
+        private ulong offeredGw, offeredLte; // bands offered for switching
+
+        /// <summary>The modem's bands can be switched one by one (see ModemStatus.Bands).</summary>
+        public bool HasBandToggles
+        {
+            get { return Kind == ModemKind.Icera || (Kind == ModemKind.Qualcomm && bandCommands); }
+        }
+
+        /// <summary>Set by <see cref="SetBands"/> when a change was stored that only a restart puts into effect.</summary>
+        public bool BandChangeNeedsRestart { get; private set; }
 
         public void Connect(string port)
         {
@@ -548,6 +560,72 @@ namespace SWTool
             }
             string hw = Lines(Query("AT$QCHWREV"));
             if (hw != null) staticDetails.Add(Pair("Hardware revision", hw));
+
+            // Band selection, where the firmware has the means (Longcheer based sticks such as the W1208):
+            // +BNDPRF holds the 2G/3G bands and applies at once; the LTE bands are NV item 6828, readable
+            // and writable with +NVRW, and only take effect after a restart.
+            ulong mask;
+            bandCommands = Parsers.ParseBndPrf(Text(Query("AT+BNDPRF?")), out mask)
+                && Parsers.ParseNvUInt64(Text(Query("AT+NVRW=0,6828")), out lteMask);
+            if (bandCommands)
+            {
+                gwMask = mask;
+                // Offer every band the modem has ever had enabled, so that one switched off can be switched
+                // on again. The modem cannot be asked what its hardware supports.
+                string key = "Bands_" + (Device.Imei ?? "unknown");
+                string[] known = (AppSettings.Get(key) ?? "").Split(',');
+                ulong knownGw = 0, knownLte = 0;
+                if (known.Length == 2)
+                {
+                    ulong.TryParse(known[0], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out knownGw);
+                    ulong.TryParse(known[1], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out knownLte);
+                }
+                offeredGw = knownGw | gwMask;
+                offeredLte = knownLte | lteMask;
+                if (offeredGw != knownGw || offeredLte != knownLte)
+                    AppSettings.Set(key, offeredGw.ToString("X", CultureInfo.InvariantCulture) + "," + offeredLte.ToString("X", CultureInfo.InvariantCulture));
+            }
+        }
+
+        /// <summary>Builds the band switches of a Longcheer based modem from its two masks.</summary>
+        private List<BandToggle> QualcommBands()
+        {
+            List<BandToggle> list = new List<BandToggle>();
+            for (int bit = 0; bit < 64; bit++)
+            {
+                if ((offeredGw & (1UL << bit)) == 0) continue;
+                BandToggle b = new BandToggle();
+                b.Id = "GW" + bit.ToString(CultureInfo.InvariantCulture);
+                b.Label = Parsers.GwBandName(bit);
+                b.Enabled = (gwMask & (1UL << bit)) != 0;
+                list.Add(b);
+            }
+            for (int bit = 0; bit < 64; bit++)
+            {
+                if ((offeredLte & (1UL << bit)) == 0) continue;
+                string name = LteBands.Name(bit + 1);
+                BandToggle b = new BandToggle();
+                b.Id = "LTE" + (bit + 1).ToString(CultureInfo.InvariantCulture);
+                b.Label = "LTE band " + (bit + 1).ToString(CultureInfo.InvariantCulture) + (name != null ? " (" + name + ")" : "");
+                b.Enabled = (lteMask & (1UL << bit)) != 0;
+                b.NeedsRestart = true;
+                list.Add(b);
+            }
+            return list;
+        }
+
+        private static string DescribeQualcommBands(List<BandToggle> bands)
+        {
+            List<string> gw = new List<string>(), lte = new List<string>();
+            foreach (BandToggle b in bands)
+            {
+                if (!b.Enabled) continue;
+                if (b.Id.StartsWith("LTE", StringComparison.Ordinal)) lte.Add("B" + b.Id.Substring(3));
+                else gw.Add(b.Name);
+            }
+            string text = string.Join(", ", gw.ToArray());
+            if (lte.Count > 0) text += (text.Length > 0 ? ", " : "") + "LTE " + string.Join(" / ", lte.ToArray());
+            return text.Length > 0 ? text : "none";
         }
 
         private bool PollQualcommState(ModemStatus s)
@@ -608,11 +686,25 @@ namespace SWTool
                 }
             }
 
-            r = Query("AT$QCBANDPREF?");
-            if (r.Ok)
+            ulong mask, nv;
+            if (bandCommands && Parsers.ParseBndPrf(Text(Query("AT+BNDPRF?")), out mask)
+                && Parsers.ParseNvUInt64(Text(Query("AT+NVRW=0,6828")), out nv))
             {
-                s.BandPrefName = Parsers.ParseQcBands(r.Text);
-                if (s.BandPrefName != null) d.Add(Pair("Enabled 2G / 3G bands", s.BandPrefName));
+                gwMask = mask;
+                lteMask = nv;
+                s.Bands = QualcommBands();
+                s.BandPrefName = DescribeQualcommBands(s.Bands);
+                d.Add(Pair("Enabled bands", s.BandPrefName));
+                d.Add(Pair("Band masks (+BNDPRF, NV 6828)", Parsers.FormatBndPrf(gwMask) + "  |  " + Parsers.FormatNvUInt64(lteMask)));
+            }
+            else
+            {
+                r = Query("AT$QCBANDPREF?");
+                if (r.Ok)
+                {
+                    s.BandPrefName = Parsers.ParseQcBands(r.Text);
+                    if (s.BandPrefName != null) d.Add(Pair("Enabled 2G / 3G bands", s.BandPrefName));
+                }
             }
 
             r = Query("AT^SYSINFO");
@@ -1057,12 +1149,79 @@ namespace SWTool
         }
 
         /// <summary>
-        /// Switches individual bands of an Icera modem (AT%IPBM="name",0|1). Bands are switched on before
-        /// others are switched off so that the modem is never left without any band.
+        /// Switches bands on a Longcheer based Qualcomm modem: the 2G/3G mask with +BNDPRF (effective at
+        /// once), the LTE mask by writing NV item 6828 (effective after a restart). Both are read back.
+        /// </summary>
+        private AtResponse SetQualcommBands(IList<BandToggle> wanted)
+        {
+            ulong gw = gwMask, lte = lteMask;
+            foreach (BandToggle w in wanted)
+            {
+                bool isLte = w.Id.StartsWith("LTE", StringComparison.Ordinal);
+                int n;
+                if (!int.TryParse(w.Id.Substring(isLte ? 3 : 2), NumberStyles.Integer, CultureInfo.InvariantCulture, out n)) continue;
+                int bit = isLte ? n - 1 : n;
+                if (bit < 0 || bit > 63) continue;
+                if (isLte) lte = w.Enabled ? lte | (1UL << bit) : lte & ~(1UL << bit);
+                else gw = w.Enabled ? gw | (1UL << bit) : gw & ~(1UL << bit);
+            }
+
+            AtResponse r = null;
+            if (gw == 0 || lte == 0)
+            {
+                // An empty mask is not a state worth trying on real hardware.
+                r = new AtResponse();
+                r.Command = "band selection";
+                r.Result = "Keep at least one 2G/3G band and one LTE band switched on. To use only one network type, "
+                    + "set the network type preference instead.";
+                return r;
+            }
+
+            if (gw != gwMask)
+            {
+                r = At.Send("AT+BNDPRF=" + Parsers.FormatBndPrf(gw), 15000);
+                if (!r.Ok) return r;
+                ulong now;
+                if (Parsers.ParseBndPrf(Text(Query("AT+BNDPRF?")), out now) && now != gw)
+                {
+                    r.Ok = false;
+                    r.Result = "OK, but the modem reports different 2G/3G bands than requested (" + Parsers.FormatBndPrf(now) + ").";
+                    return r;
+                }
+                gwMask = gw;
+            }
+            if (lte != lteMask)
+            {
+                r = At.Send("AT+NVRW=1,6828,\"" + Parsers.FormatNvUInt64(lte) + "\"", 15000);
+                if (!r.Ok) return r;
+                ulong now;
+                if (Parsers.ParseNvUInt64(Text(Query("AT+NVRW=0,6828")), out now) && now != lte)
+                {
+                    r.Ok = false;
+                    r.Result = "OK, but the modem's LTE band setting reads back differently (" + Parsers.FormatNvUInt64(now) + ").";
+                    return r;
+                }
+                lteMask = lte;
+                BandChangeNeedsRestart = true;
+            }
+            return r;
+        }
+
+        /// <summary>
+        /// Switches individual bands. On an Icera modem with AT%IPBM="name",0|1, where bands are switched
+        /// on before others are switched off so that the modem is never left without any band.
         /// Returns the response of the first command that failed, or of the last one sent (null if nothing changed).
         /// </summary>
         public AtResponse SetBands(IList<BandToggle> current, IList<BandToggle> wanted)
         {
+            BandChangeNeedsRestart = false;
+            if (Kind == ModemKind.Qualcomm)
+            {
+                AtResponse result = SetQualcommBands(wanted);
+                InvalidateSlowItems();
+                return result;
+            }
+
             AtResponse lastResponse = null;
             foreach (bool enable in new[] { true, false })
             {

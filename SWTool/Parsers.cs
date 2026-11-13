@@ -632,6 +632,69 @@ namespace SWTool
             return names.Count > 0 ? string.Join(", ", names.ToArray()) : null;
         }
 
+        /// <summary>
+        /// "+BNDPRF: 384,104,131072": the 2G/3G band mask of Longcheer firmware in three parts,
+        /// bits 0-15, 16-31 and 32-63 of Qualcomm's band preference.
+        /// </summary>
+        public static bool ParseBndPrf(string text, out ulong mask)
+        {
+            mask = 0;
+            Match m = Regex.Match(text ?? "", @"\+BNDPRF:\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)");
+            if (!m.Success) return false;
+            ulong low, mid, high;
+            if (!ulong.TryParse(m.Groups[1].Value, out low) || !ulong.TryParse(m.Groups[2].Value, out mid)
+                || !ulong.TryParse(m.Groups[3].Value, out high)) return false;
+            mask = (low & 0xFFFF) | ((mid & 0xFFFF) << 16) | ((high & 0xFFFFFFFF) << 32);
+            return true;
+        }
+
+        public static string FormatBndPrf(ulong mask)
+        {
+            return (mask & 0xFFFF).ToString(Inv) + "," + ((mask >> 16) & 0xFFFF).ToString(Inv) + "," + (mask >> 32).ToString(Inv);
+        }
+
+        /// <summary>Reads the first eight bytes of an NV item dump ("+NVRW:"C5000800..."") as a little endian number.</summary>
+        public static bool ParseNvUInt64(string text, out ulong value)
+        {
+            value = 0;
+            Match m = Regex.Match(text ?? "", @"\+NVRW:\s*""([0-9A-Fa-f]{16})");
+            if (!m.Success) return false;
+            for (int i = 7; i >= 0; i--)
+                value = (value << 8) | Convert.ToByte(m.Groups[1].Value.Substring(i * 2, 2), 16);
+            return true;
+        }
+
+        public static string FormatNvUInt64(ulong value)
+        {
+            System.Text.StringBuilder sb = new System.Text.StringBuilder(16);
+            for (int i = 0; i < 8; i++) sb.Append(((byte)(value >> (8 * i))).ToString("X2", Inv));
+            return sb.ToString();
+        }
+
+        /// <summary>Name of a bit of Qualcomm's 2G/3G band preference mask.</summary>
+        public static string GwBandName(int bit)
+        {
+            switch (bit)
+            {
+                case 7: return "GSM 1800";
+                case 8: return "GSM 900";
+                case 9: return "GSM 900 (P-GSM)";
+                case 19: return "GSM 850";
+                case 20: return "GSM 900 (R-GSM)";
+                case 21: return "GSM 1900";
+                case 22: return "UMTS 2100 (band 1)";
+                case 23: return "UMTS 1900 (band 2)";
+                case 24: return "UMTS 1800 (band 3)";
+                case 25: return "UMTS 1700/2100 AWS (band 4)";
+                case 26: return "UMTS 850 (band 5)";
+                case 27: return "UMTS 800 (band 6)";
+                case 48: return "UMTS 2600 (band 7)";
+                case 49: return "UMTS 900 (band 8)";
+                case 50: return "UMTS 1700 (band 9)";
+                default: return "2G/3G band bit " + bit.ToString(Inv);
+            }
+        }
+
         /// <summary>"^SYSINFO: 2,3,1,5,1": service status, domain, roaming, system mode, SIM state.</summary>
         public static void ParseSysInfo(string text, List<KeyValuePair<string, string>> details)
         {

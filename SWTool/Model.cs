@@ -52,11 +52,16 @@ namespace SWTool
     {
         public string Id = "";
         public bool Enabled;
+        /// <summary>Display name where the id is not one of the Icera band names.</summary>
+        public string Label;
+        /// <summary>A change of this band only takes effect after the modem has been restarted.</summary>
+        public bool NeedsRestart;
 
         public string Name
         {
             get
             {
+                if (Label != null) return Label;
                 switch (Id)
                 {
                     case "ANY": return "All bands (automatic)";

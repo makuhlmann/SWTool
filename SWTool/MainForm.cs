@@ -341,6 +341,7 @@ namespace SWTool
             // Modems with individually switchable bands get a dialog instead of the preset list.
             bandsButton = MakeButton("Choose...", OnBandsClick);
             bandsLabel = MakeLabel("");
+            bandsLabel.MaximumSize = new Size(620, 0); // long band lists wrap instead of running off the window
             bandsCaption = MakeLabel("      Bands:");
             prefFlow.Controls.Add(MakeLabel("Network type:"));
             prefFlow.Controls.Add(ratCombo);
@@ -683,8 +684,8 @@ namespace SWTool
             foreach (Choice c in modem.BandChoices) bandCombo.Items.Add(c);
 
             bool presets = modem.BandChoices.Count > 0;
-            bool toggles = modem.Kind == ModemKind.Icera;
-            bool listOnly = modem.Kind == ModemKind.Qualcomm; // bands are shown but cannot be changed here
+            bool toggles = modem.HasBandToggles;
+            bool listOnly = modem.Kind == ModemKind.Qualcomm && !toggles; // bands are shown but cannot be changed
             bandsCaption.Visible = presets || toggles || listOnly;
             bandCombo.Visible = bandApply.Visible = presets;
             bandsButton.Visible = toggles;
@@ -1317,7 +1318,13 @@ namespace SWTool
                 + "a running search or registration ends, and the data connection is interrupted. SWTool reconnects "
                 + "when the modem is back.\n\nUse it when the modem has stopped answering.",
                 "Restart modem", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
+            await RestartModem();
+        }
 
+        /// <summary>Sends the restart and lets the retry loop reconnect; the caller has asked the user.</summary>
+        private async Task RestartModem()
+        {
+            if (!connected || restarting) return;
             restarting = true;
             UpdateEnabled();
             SetStatus("Restarting the modem...");
@@ -1374,10 +1381,12 @@ namespace SWTool
             if (wanted == null) return;
 
             List<string> on = new List<string>(), off = new List<string>();
+            bool afterRestart = false;
             for (int i = 0; i < current.Count; i++)
             {
                 if (current[i].Enabled == wanted[i].Enabled) continue;
-                (wanted[i].Enabled ? on : off).Add(wanted[i].Name);
+                (wanted[i].Enabled ? on : off).Add(current[i].Name);
+                afterRestart |= current[i].NeedsRestart;
             }
             if (on.Count == 0 && off.Count == 0) return;
 
@@ -1385,7 +1394,9 @@ namespace SWTool
                 + (on.Count > 0 ? "Switch on:  " + string.Join(", ", on.ToArray()) + "\n" : "")
                 + (off.Count > 0 ? "Switch off:  " + string.Join(", ", off.ToArray()) + "\n" : "")
                 + "\nThe setting is stored in the modem and survives restarts. If none of the remaining bands is "
-                + "available here, the modem has no service until you change it back.";
+                + "available here, the modem has no service until you change it back."
+                + (afterRestart ? "\n\nThe LTE bands are written to the modem's configuration memory and only take effect "
+                    + "after it has been restarted." : "");
             if (MessageBox.Show(this, question, "Bands", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
 
             AtResponse r;
@@ -1399,16 +1410,21 @@ namespace SWTool
                 return;
             }
             if (closing || r == null) return;
-            if (r.Ok)
-            {
-                SetStatus("Bands changed");
-            }
-            else
+            if (!r.Ok)
             {
                 MessageBox.Show(this, "The modem rejected a band change.\n\nCommand: " + r.Command + "\n"
                     + (r.TimedOut ? "The modem did not answer in time." : "Modem response: " + r.Result)
                     + "\n\nBands changed before this one stay changed; the list below shows the result.",
                     "SWTool", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            SetStatus("Bands changed");
+            if (modem.BandChangeNeedsRestart && MessageBox.Show(this,
+                "The LTE band selection is stored, but the modem keeps using the previous one until it is restarted.\n\n"
+                + "Restart the modem now? It disappears for about half a minute and the data connection is interrupted.",
+                "Bands", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
+            {
+                await RestartModem();
             }
         }
 
@@ -1428,7 +1444,11 @@ namespace SWTool
                 dlg.ClientSize = new Size(320, 330);
 
                 Label hint = new Label();
-                hint.Text = "Bands the modem may use. Bands its hardware does not have are rejected when applied.";
+                bool anyRestart = false;
+                foreach (BandToggle b in current) anyRestart |= b.NeedsRestart;
+                hint.Text = anyRestart
+                    ? "Bands the modem may use. LTE band changes take effect after a modem restart."
+                    : "Bands the modem may use. Bands its hardware does not have are rejected when applied.";
                 hint.SetBounds(12, 10, 296, 34);
 
                 CheckedListBox list = new CheckedListBox();

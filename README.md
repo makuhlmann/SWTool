@@ -8,7 +8,7 @@ command dialects are known in detail:
 | --- | --- | --- |
 | Sierra Wireless (`AT!...`) | EM7455 (LTE) | RSRP / RSRQ / SINR per antenna, band, bandwidth, channel, TAC, eNodeB/sector, PCI, LTE neighbour cells, temperature, network type and band presets |
 | Icera based sticks (`AT%...`) | Nokia 7M-01 (2G/3G) | GPRS / EDGE / HSPA state, level in dBm, bit error class, LAC, routing area, cell ID, measured cells, home network, firmware parts, network type preference and individual band switches |
-| Plain Qualcomm sticks (`AT$QC...`, `AT*CNTI`, `AT^SYSINFO`) | 4G Systems W1208 (2G/3G/LTE) | System mode and technology, RSCP / Ec/Io on UMTS, RSRP / RSRQ, PCI and channel of LTE cells, LAC or TAC, cell ID, service status, the network's last error report, APN profiles, home network, network type preference, enabled 2G/3G bands (read only) |
+| Plain Qualcomm sticks (`AT$QC...`, `AT*CNTI`, `AT^SYSINFO`) | 4G Systems W1208 (2G/3G/LTE) | System mode and technology, RSCP / Ec/Io on UMTS, RSRP / RSRQ, PCI and channel of LTE cells, LAC or TAC, cell ID, service status, the network's last error report, APN profiles, home network, network type preference, individual band switches for 2G/3G and LTE |
 
 The tabs:
 
@@ -110,14 +110,26 @@ The result is `SWTool\bin\Release\SWTool.exe`, a single file with no dependencie
   stick could not use LTE because its first APN profile did not belong to the SIM ("Missing or unknown APN").
 - On UMTS the modem prints the levels of the LTE cells it watches divided by ten ("-009.30" for -93 dBm);
   values outside the physically possible range are scaled back.
-- Bands (`$QCBANDPREF`) are listed but not changed: the command's write syntax is undocumented and it does
-  not cover LTE bands.
+- Bands can be switched one by one ("Choose..." on the Networks tab) where the firmware has the Longcheer
+  commands for it, as the W1208 does:
+  - 2G/3G bands with `AT+BNDPRF=<a>,<b>,<c>`, the bits 0-15, 16-31 and 32-63 of Qualcomm's band preference
+    mask. Effective at once.
+  - LTE bands by writing NV item 6828 (the LTE band mask, bit n-1 for band n) with `AT+NVRW=1,6828,"<8 bytes
+    hex>"`. This is the modem's configuration memory, and the modem only reads it at start-up, so SWTool
+    offers a restart afterwards. Both settings are read back after writing.
+  - The modem cannot say which bands its hardware has, so SWTool offers every band it has ever seen enabled
+    on that modem (remembered per IMEI under `HKCU\Software\SWTool`), and refuses to switch off the last
+    2G/3G band or the last LTE band.
+  - `AT+LTEBAND` (values 0 and 1) is not a band list: it changes none of the masks and only makes the modem
+    re-acquire the network.
+  Other plain Qualcomm modems get the 2G/3G bands of `$QCBANDPREF?` as a read-only list.
 
 ## Source layout
 
 | File | Purpose |
 | --- | --- |
 | `ApnDialog.cs` | The APN profile list and editor |
+| `AppSettings.cs` | Per-user settings in the registry |
 | `AtChannel.cs` | Serial port access, one AT command at a time |
 | `ModemPorts.cs` | Finds candidate AT ports via WMI |
 | `Modem.cs` | Modem type detection, polling and the scan / register / preference operations |

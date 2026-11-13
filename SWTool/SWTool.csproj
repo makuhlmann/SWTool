@@ -41,6 +41,7 @@
     <Compile Include="ApnDialog.cs">
       <SubType>Form</SubType>
     </Compile>
+    <Compile Include="AppSettings.cs" />
     <Compile Include="AtChannel.cs" />
     <Compile Include="Controls.cs">
       <SubType>Component</SubType>
