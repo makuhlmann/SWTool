@@ -332,15 +332,49 @@ namespace SWTool
         public static RegInfo ParseRegInfo(string text)
         {
             RegInfo info = new RegInfo();
-            Match m = Regex.Match(text, @"\+C[EG]?REG:\s*\d+\s*,\s*(\d+)"
-                + @"(?:\s*,\s*""?([0-9A-Fa-f]+)""?\s*,\s*""?([0-9A-Fa-f]+)""?(?:\s*,\s*(\d+))?(?:\s*,\s*""?([0-9A-Fa-f]+)""?)?)?");
+            Match m = Regex.Match(text, @"\+C[EG]?REG:\s*\d+\s*,\s*(\d+)([^\n]*)");
             if (!m.Success) return info;
             info.Stat = int.Parse(m.Groups[1].Value, Inv);
+
+            // Quoted fields are hexadecimal identifiers, the unquoted one is the access technology.
+            // Qualcomm modems put a third identifier between area code and cell ID in +CEREG
+            // ("3102","50","22E4514",7); the routing area of +CGREG comes after the technology.
+            List<string> ids = new List<string>();
+            List<string> bare = new List<string>();
+            bool actSeen = false;
+            foreach (Match f in Regex.Matches(m.Groups[2].Value, @",\s*(?:""([0-9A-Fa-f]*)""|([0-9A-Fa-f]+))"))
+            {
+                if (f.Groups[1].Success)
+                {
+                    if (!actSeen) ids.Add(f.Groups[1].Value);
+                    else if (info.Rac == null) info.Rac = f.Groups[1].Value.ToUpperInvariant();
+                }
+                else
+                {
+                    bare.Add(f.Groups[2].Value);
+                    int act;
+                    if (ids.Count > 0 && !actSeen && int.TryParse(f.Groups[2].Value, NumberStyles.Integer, Inv, out act))
+                    {
+                        info.Act = act;
+                        actSeen = true;
+                    }
+                }
+            }
+            if (ids.Count == 0 && bare.Count >= 2)
+            {
+                // A few modems leave the quotes away: lac, ci, technology.
+                ids.Add(bare[0]);
+                ids.Add(bare[1]);
+                int act;
+                if (bare.Count > 2 && int.TryParse(bare[2], NumberStyles.Integer, Inv, out act)) info.Act = act;
+            }
+
             long v;
-            if (m.Groups[2].Success && long.TryParse(m.Groups[2].Value, NumberStyles.HexNumber, Inv, out v)) info.Lac = v;
-            if (m.Groups[3].Success && long.TryParse(m.Groups[3].Value, NumberStyles.HexNumber, Inv, out v)) info.Ci = v;
-            if (m.Groups[4].Success) info.Act = int.Parse(m.Groups[4].Value, Inv);
-            if (m.Groups[5].Success) info.Rac = m.Groups[5].Value.ToUpperInvariant();
+            if (ids.Count >= 2)
+            {
+                if (long.TryParse(ids[0], NumberStyles.HexNumber, Inv, out v)) info.Lac = v;
+                if (long.TryParse(ids[ids.Count - 1], NumberStyles.HexNumber, Inv, out v)) info.Ci = v;
+            }
             return info;
         }
 
@@ -472,9 +506,199 @@ namespace SWTool
                 if (!m.Success) continue;
                 int from = int.Parse(m.Groups[1].Value, Inv);
                 int to = m.Groups[2].Success ? int.Parse(m.Groups[2].Value, Inv) : from;
-                for (int i = from; i <= to && i - from < 64; i++) list.Add(i);
+                for (int i = from; i <= to && i - from < 256; i++) list.Add(i);
             }
             return list;
+        }
+
+        // ------------------------------------------------------------------ plain Qualcomm ($QC, *CNTI, ^SYS)
+
+        /// <summary>"*CNTI: 0,HSDPA": the technology in use, which refines GSM and UMTS.</summary>
+        public static void ParseCnti(string text, ModemStatus s)
+        {
+            Match m = Regex.Match(text, @"\*CNTI:\s*\d+\s*,\s*([^\n,]+)");
+            if (!m.Success) return;
+            string tech = m.Groups[1].Value.Trim();
+            string upper = tech.ToUpperInvariant();
+            s.Details.Add(new KeyValuePair<string, string>("Technology (*CNTI)", tech));
+            if (upper.Contains("HSPA+")) s.SubTech = "HSPA+";
+            else if (upper.Contains("HSPA")) s.SubTech = "HSPA";
+            else if (upper.Contains("HSDPA")) s.SubTech = "HSDPA";
+            else if (upper.Contains("HSUPA")) s.SubTech = "HSUPA";
+            else if (upper.Contains("EDGE")) s.SubTech = "EDGE";
+            else if (upper.Contains("GPRS")) s.SubTech = "GPRS";
+        }
+
+        /// <summary>"$QCSQ :-65,-4,0,0,-69": RSCP, Ec/Io, SIR, path loss and RSSI of the UMTS serving cell.</summary>
+        public static void ParseQcsq(string text, ModemStatus s)
+        {
+            Match m = Regex.Match(text, @"\$QCSQ\s*:\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)");
+            if (!m.Success) return;
+            s.Details.Add(new KeyValuePair<string, string>("Signal measurement ($QCSQ: RSCP, Ec/Io, SIR, path loss, RSSI)",
+                Regex.Replace(m.Value, @"^\$QCSQ\s*:\s*", "")));
+            double rscp = double.Parse(m.Groups[1].Value, Inv), ecio = double.Parse(m.Groups[2].Value, Inv);
+            double rssi = double.Parse(m.Groups[5].Value, Inv);
+            // The last value is the total received power on LTE as well; the others only mean something on UMTS.
+            if (rssi < 0 && rssi > -125 && (s.IsWcdma || s.IsLte)) s.Rssi = rssi;
+            if (!s.IsWcdma) return;
+            if (rscp < 0 && rscp > -130) s.Rscp = rscp;
+            if (ecio <= 0 && ecio > -32) s.Ecio = ecio;
+        }
+
+        /// <summary>
+        /// "$QCRSRP: 308,3350,"-093.00",434,3350,...": LTE cells as PCI, EARFCN and level, strongest first.
+        /// $QCRSRQ has the same layout with the quality. On UMTS these are the LTE cells the modem keeps
+        /// an eye on; there the W1208 prints the values divided by ten ("-009.30" for -93 dBm), which is
+        /// undone when a value lies outside what the quantity can be.
+        /// </summary>
+        public static void ParseQcLteCells(string rsrpText, string rsrqText, ModemStatus s)
+        {
+            Regex triple = new Regex(@"(\d+)\s*,\s*(\d+)\s*,\s*""\s*(-?\d+(?:\.\d+)?)\s*""");
+            Dictionary<string, double> quality = new Dictionary<string, double>();
+            foreach (Match m in triple.Matches(rsrqText ?? ""))
+            {
+                double q = double.Parse(m.Groups[3].Value, Inv);
+                if (q > -3) q *= 10; // RSRQ cannot be better than -3 dB
+                quality[m.Groups[1].Value.TrimStart('0') + "/" + m.Groups[2].Value] = q;
+            }
+
+            bool first = true;
+            foreach (Match m in triple.Matches(rsrpText ?? ""))
+            {
+                string pci = m.Groups[1].Value.TrimStart('0');
+                if (pci.Length == 0) pci = "0";
+                double level = double.Parse(m.Groups[3].Value, Inv);
+                if (level >= 0) continue;     // unused slots are printed as 000,<channel>,"000.00"
+                if (level > -30) level *= 10; // RSRP cannot be stronger than -44 dBm
+
+                CellInfo c = new CellInfo();
+                c.Channel = m.Groups[2].Value;
+                c.Id = pci;
+                c.Level = level.ToString("0.#", Inv);
+                double q;
+                bool hasQuality = quality.TryGetValue(pci + "/" + c.Channel, out q);
+                if (hasQuality) c.Qual = q.ToString("0.#", Inv);
+                int earfcn, band; double mhz;
+                if (int.TryParse(c.Channel, out earfcn) && LteBands.FromEarfcn(earfcn, out band, out mhz)) c.Band = "B" + band;
+
+                if (first && s.IsLte)
+                {
+                    c.Kind = "Serving cell (LTE)";
+                    s.Pci = int.Parse(pci, Inv);
+                    s.Rsrp = level;
+                    if (hasQuality) s.Rsrq = q;
+                    s.RxChannel = c.Channel;
+                    if (c.Band.Length > 0) s.Band = c.Band;
+                }
+                else
+                {
+                    c.Kind = s.IsLte ? "LTE neighbour" : "LTE cell (measured from " + (s.IsWcdma ? "UMTS" : "GSM") + ")";
+                }
+                first = false;
+                s.Cells.Add(c);
+            }
+        }
+
+        /// <summary>Names for the values of AT+WS46 (3GPP TS 27.007).</summary>
+        public static string Ws46Name(int value)
+        {
+            switch (value)
+            {
+                case 12: return "GSM only (2G)";
+                case 22: return "UMTS only (3G)";
+                case 25: return "Automatic (2G / 3G / 4G)";
+                case 28: return "LTE only (4G)";
+                case 29: return "GSM and UMTS (2G / 3G)";
+                case 30: return "GSM and LTE (2G / 4G)";
+                case 31: return "UMTS and LTE (3G / 4G)";
+                default: return "Mode " + value.ToString(Inv);
+            }
+        }
+
+        /// <summary>Lists the bands of AT$QCBANDPREF? ("8.GSM_DCS_1800" ...) in readable form.</summary>
+        public static string ParseQcBands(string text)
+        {
+            List<string> names = new List<string>();
+            foreach (Match m in Regex.Matches(text, @"""\s*\d+\.([A-Za-z0-9_]+)\s*"""))
+            {
+                string raw = m.Groups[1].Value;
+                Match g = Regex.Match(raw, @"^GSM_(?:[A-Z]+_)?(\d+)$");
+                Match w = Regex.Match(raw, @"^WCDMA_([IVX]+)_(?:[A-Z]+_)?(\d+)$");
+                if (raw == "Any") names.Add("All bands");
+                else if (g.Success) names.Add("GSM " + g.Groups[1].Value);
+                else if (w.Success) names.Add("UMTS " + (w.Groups[2].Value == "2000" ? "2100" : w.Groups[2].Value) + " (band " + w.Groups[1].Value + ")");
+                else names.Add(raw.Replace('_', ' '));
+            }
+            return names.Count > 0 ? string.Join(", ", names.ToArray()) : null;
+        }
+
+        /// <summary>"^SYSINFO: 2,3,1,5,1": service status, domain, roaming, system mode, SIM state.</summary>
+        public static void ParseSysInfo(string text, List<KeyValuePair<string, string>> details)
+        {
+            Match m = Regex.Match(text, @"\^SYSINFO:\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)");
+            if (!m.Success) return;
+            string[] service = { "No service", "Restricted service", "Valid service", "Restricted regional service", "Power saving" };
+            string[] domain = { "No service", "Voice / SMS only (CS)", "Packet data only (PS)", "Voice and packet data (CS + PS)", "Searching" };
+            string[] sim = { "Invalid or missing", "Valid" };
+            details.Add(new KeyValuePair<string, string>("Service status", Pick(service, m.Groups[1].Value)));
+            details.Add(new KeyValuePair<string, string>("Service domain", Pick(domain, m.Groups[2].Value)));
+            details.Add(new KeyValuePair<string, string>("SIM state", Pick(sim, m.Groups[5].Value)));
+        }
+
+        private static string Pick(string[] names, string index)
+        {
+            int i;
+            return int.TryParse(index, out i) && i >= 0 && i < names.Length ? names[i] : "Code " + index;
+        }
+
+        /// <summary>
+        /// Combines +CGDCONT? (profiles), +CGACT? (which are in use) and, where the modem has it,
+        /// $QCPDPP? (authentication type and user name; passwords are never reported).
+        /// </summary>
+        public static List<ApnProfile> ParseApnProfiles(string cgdcont, string cgact, string qcpdpp)
+        {
+            List<ApnProfile> list = new List<ApnProfile>();
+            foreach (Match m in Regex.Matches(cgdcont ?? "", @"\+CGDCONT:\s*(\d+)\s*,\s*""([^""]*)""\s*,\s*""([^""]*)"""))
+            {
+                ApnProfile p = new ApnProfile();
+                p.Id = int.Parse(m.Groups[1].Value, Inv);
+                p.Type = m.Groups[2].Value;
+                p.Apn = m.Groups[3].Value;
+                p.Active = Regex.IsMatch(cgact ?? "", @"\+CGACT:\s*" + p.Id.ToString(Inv) + @"\s*,\s*1\b");
+                Match a = Regex.Match(qcpdpp ?? "", @"\$QCPDPP:\s*" + p.Id.ToString(Inv) + @"\s*,\s*(\d+)(?:\s*,\s*""([^""]*)"")?");
+                if (a.Success)
+                {
+                    p.Auth = int.Parse(a.Groups[1].Value, Inv);
+                    p.User = a.Groups[2].Success ? a.Groups[2].Value : "";
+                }
+                list.Add(p);
+            }
+            list.Sort(delegate(ApnProfile x, ApnProfile y) { return x.Id.CompareTo(y.Id); });
+            return list;
+        }
+
+        /// <summary>
+        /// Reads what +CGDCONT=? allows: the profile numbers and the IP types
+        /// ("+CGDCONT: (1-24,100-179),"IPV4V6",,,..." once per type).
+        /// </summary>
+        public static void ParseApnLimits(string text, List<int> ids, List<string> types)
+        {
+            foreach (Match m in Regex.Matches(text ?? "", @"\+CGDCONT:\s*(\([^)]*\))\s*,\s*""([^""]+)"""))
+            {
+                if (ids.Count == 0) ids.AddRange(ParseRange(m.Groups[1].Value));
+                string type = m.Groups[2].Value.ToUpperInvariant();
+                // PPP contexts belong to dial-up connections and are of no use here.
+                if (type != "PPP" && !types.Contains(type)) types.Add(type);
+            }
+        }
+
+        /// <summary>All defined contexts of +CGDCONT? as "1: internet (IPV4V6)".</summary>
+        public static string ContextList(string cgdcont)
+        {
+            List<string> parts = new List<string>();
+            foreach (Match m in Regex.Matches(cgdcont, @"\+CGDCONT:\s*(\d+)\s*,\s*""([^""]*)""\s*,\s*""([^""]*)"""))
+                parts.Add(m.Groups[1].Value + ": " + (m.Groups[3].Value.Length > 0 ? m.Groups[3].Value : "(none)") + " (" + m.Groups[2].Value + ")");
+            return parts.Count > 0 ? string.Join(",  ", parts.ToArray()) : null;
         }
 
         // ------------------------------------------------------------------ packet data (standard commands)

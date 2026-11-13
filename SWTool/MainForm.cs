@@ -22,7 +22,7 @@ namespace SWTool
         private int intervalMs = 2000;
         // modemBusy: the modem is still working on a command and takes nothing new (see AtChannel).
         private bool modemBusy, registering, cancelling, restarting;
-        private Button restartButton;
+        private Button restartButton, apnButton;
         private string busyText;
         private DateTime busyStart;
         private DateTime nextPoll = DateTime.MinValue, nextReconnect = DateTime.MinValue;
@@ -350,6 +350,10 @@ namespace SWTool
             prefFlow.Controls.Add(bandApply);
             prefFlow.Controls.Add(bandsButton);
             prefFlow.Controls.Add(bandsLabel);
+            // On a row of its own: the band list of some modems fills the first one.
+            apnButton = MakeButton("APN profiles...", OnApnClick);
+            prefFlow.SetFlowBreak(bandsLabel, true);
+            prefFlow.Controls.Add(apnButton);
             prefs.Controls.Add(prefFlow);
 
             TableLayoutPanel root = new TableLayoutPanel();
@@ -617,6 +621,20 @@ namespace SWTool
             SetStatus(reason);
         }
 
+        /// <summary>Opens the editor for the connection profiles stored in the modem.</summary>
+        private void OnApnClick(object sender, EventArgs e)
+        {
+            if (!connected || busy || modemBusy || !modem.SupportsApnProfiles) return;
+            using (ApnDialog dlg = new ApnDialog(this, modem)) dlg.ShowDialog(this);
+            if (!closing) UpdateEnabled();
+        }
+
+        /// <summary>For dialogs: a modem operation failed because the port went away.</summary>
+        internal void ModemFailed(Exception ex)
+        {
+            if (!closing) ConnectionLost(ex);
+        }
+
         private void ConnectionLost(Exception ex)
         {
             if (closing || !connected) return;
@@ -646,6 +664,7 @@ namespace SWTool
             registerButton.Text = registering && canCancel ? "Cancel registration" : "Register on selected network";
             registerButton.Enabled = registering ? canCancel && !cancelling : idle && networkList.SelectedItems.Count == 1;
             restartButton.Enabled = connected && !restarting;
+            apnButton.Enabled = idle && modem.SupportsApnProfiles;
             lockType.Enabled = idle;
             ratCombo.Enabled = idle && ratCombo.Items.Count > 0;
             bandCombo.Enabled = idle && bandCombo.Items.Count > 0;
@@ -665,9 +684,11 @@ namespace SWTool
 
             bool presets = modem.BandChoices.Count > 0;
             bool toggles = modem.Kind == ModemKind.Icera;
-            bandsCaption.Visible = presets || toggles;
+            bool listOnly = modem.Kind == ModemKind.Qualcomm; // bands are shown but cannot be changed here
+            bandsCaption.Visible = presets || toggles || listOnly;
             bandCombo.Visible = bandApply.Visible = presets;
-            bandsButton.Visible = bandsLabel.Visible = toggles;
+            bandsButton.Visible = toggles;
+            bandsLabel.Visible = toggles || listOnly;
             bandsLabel.Text = "";
 
             switch (modem.Kind)
@@ -679,6 +700,10 @@ namespace SWTool
                 case ModemKind.Icera:
                     cellsInfo.Text = "The serving cell (from the registration info) and the cells the modem currently measures (AT%INCELL), "
                         + "strongest first. This modem reports no channel numbers, and a cell ID only once it has read that cell's broadcast info.";
+                    break;
+                case ModemKind.Qualcomm:
+                    cellsInfo.Text = "The serving cell (from the registration info) and the LTE cells the modem measures (AT$QCRSRP, AT$QCRSRQ). "
+                        + "This modem reports no UMTS or GSM neighbour cells, and LTE cells only while it has measurements for them.";
                     break;
                 default:
                     cellsInfo.Text = "This modem does not report cell measurements through standard AT commands.";
@@ -761,7 +786,7 @@ namespace SWTool
         }
 
         /// <summary>Runs a long modem operation while the poller is paused and the action buttons are disabled.</summary>
-        private async Task<T> RunBusy<T>(string statusText, Func<T> operation)
+        internal async Task<T> RunBusy<T>(string statusText, Func<T> operation)
         {
             string previous = statusLabel.Text;
             busy = true;
@@ -926,7 +951,7 @@ namespace SWTool
             foreach (CellInfo c in s.Cells)
                 cells.Add(new[] { c.Kind, c.Channel, c.Band, c.Id, c.Area, c.Level, c.Qual, c.Rssi });
             neighbourList.SetRows(cells, null);
-            if (s.Bands != null && bandsLabel.Text != (s.BandPrefName ?? "")) bandsLabel.Text = s.BandPrefName ?? "";
+            if (bandsLabel.Visible && bandsLabel.Text != (s.BandPrefName ?? "")) bandsLabel.Text = s.BandPrefName ?? "";
 
             ShowDetails(s);
 
@@ -1062,6 +1087,9 @@ namespace SWTool
                 combo.SelectedItem = o;
                 return;
             }
+            // The modem is on a setting that is not among the choices (e.g. "LTE only" after a locked
+            // registration on a modem that cannot be set to it directly): show none rather than a wrong one.
+            combo.SelectedIndex = -1;
         }
 
         // ============================================================ network search and selection
@@ -1193,10 +1221,10 @@ namespace SWTool
             bool sierra = modem.Kind == ModemKind.Sierra;
             string question = "Register manually on " + what + (wantLock ? " using " + tech + " only" : "") + "?\n\n"
                 + "The modem stays on this network until you choose another one or switch back to automatic selection.\n\n";
-            if (sierra && wantLock)
+            if (modem.RegistrationSetsTypePreference && wantLock)
             {
-                // On the EM7455 a manual registration always rewrites the network type preference (!SELRAT):
-                // to the named type only, or to Automatic when no type is named. Say so before doing it.
+                // On the EM7455 and the W1208 a registration that names a type rewrites the network type
+                // preference to that type only. Say so before doing it.
                 question += "The modem's network type preference becomes \"" + tech + " only\". It will not fall back to "
                     + "another network type until you change that preference (\"Network type\" below).";
             }
@@ -1245,7 +1273,7 @@ namespace SWTool
             }
 
             string outcome = res.StillPending ? "The modem is still working on the command; its port stays busy until it answers."
-                : res.OperatorSelected ? "It now uses whichever network type this operator offers."
+                : res.OperatorSelected ? "The type restriction was taken back, so it uses whichever network type this operator offers."
                 : res.Reverted ? "The modem returns to its previous network."
                 : "The modem could not be put back on its previous network. Choose a network or use Automatic selection.";
             if (res.Cancelled && (res.Reverted || res.OperatorSelected))

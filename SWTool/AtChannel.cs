@@ -120,10 +120,14 @@ namespace SWTool
             Close();
         }
 
-        public AtResponse Send(string command, int timeoutMs = 3000, bool background = false)
+        /// <param name="command">The AT command line.</param>
+        /// <param name="timeoutMs">How long to wait for the result code.</param>
+        /// <param name="background">True for polling, which the console only shows on request.</param>
+        /// <param name="displayAs">Text to show and keep instead of the command, for commands that carry a password.</param>
+        public AtResponse Send(string command, int timeoutMs = 3000, bool background = false, string displayAs = null)
         {
             AtResponse resp = new AtResponse();
-            resp.Command = command;
+            resp.Command = displayAs ?? command;
             AtResponse late = null;
             lock (sync)
             {
@@ -164,7 +168,7 @@ namespace SWTool
                         resp.Result = "TIMEOUT";
                         resp.Text = Normalize(sb.ToString(), command);
                         // Keep what arrived so far: the result code may follow much later.
-                        pendingCommand = command;
+                        pendingCommand = resp.Command;
                         pendingOffsetMs = sw.ElapsedMilliseconds;
                         pendingClock.Restart();
                         pendingText.Clear();

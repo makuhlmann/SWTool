@@ -14,7 +14,17 @@ namespace SWTool
     }
 
     /// <summary>Command dialects the tool knows. Everything else is handled with standard 3GPP commands only.</summary>
-    public enum ModemKind { Generic, Sierra, Icera }
+    public enum ModemKind
+    {
+        /// <summary>Standard 3GPP commands only.</summary>
+        Generic,
+        /// <summary>Sierra Wireless ("AT!..."), e.g. EM7455.</summary>
+        Sierra,
+        /// <summary>Icera chipset ("AT%..."), e.g. Nokia 7M-01.</summary>
+        Icera,
+        /// <summary>Plain Qualcomm command set ("AT$QC...", "AT*CNTI", "AT^SYSINFO"), e.g. 4G Systems W1208.</summary>
+        Qualcomm
+    }
 
     public sealed class CellInfo
     {
@@ -109,6 +119,31 @@ namespace SWTool
         public bool StillPending;
 
         public bool Success { get { return OperatorSelected && (!LockRequested || TypeLocked); } }
+    }
+
+    /// <summary>A connection profile (PDP context definition) stored in the modem: AT+CGDCONT, plus $QCPDPP for sign-in data.</summary>
+    public sealed class ApnProfile
+    {
+        public int Id;
+        public string Type = "IP";
+        public string Apn = "";
+        /// <summary>A data session is using this profile right now.</summary>
+        public bool Active;
+        /// <summary>0 none, 1 PAP, 2 CHAP, 3 PAP or CHAP; -1 if the modem does not tell.</summary>
+        public int Auth = -1;
+        public string User = "";
+
+        public static string AuthName(int auth)
+        {
+            switch (auth)
+            {
+                case 0: return "None";
+                case 1: return "PAP";
+                case 2: return "CHAP";
+                case 3: return "PAP or CHAP";
+                default: return "";
+            }
+        }
     }
 
     /// <summary>An entry of an index/name list such as AT!SELRAT=? or AT!BAND=?.</summary>

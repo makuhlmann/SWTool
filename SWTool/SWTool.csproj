@@ -38,6 +38,9 @@
     <Reference Include="System.Windows.Forms" />
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="ApnDialog.cs">
+      <SubType>Form</SubType>
+    </Compile>
     <Compile Include="AtChannel.cs" />
     <Compile Include="Controls.cs">
       <SubType>Component</SubType>

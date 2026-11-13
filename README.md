@@ -8,6 +8,7 @@ command dialects are known in detail:
 | --- | --- | --- |
 | Sierra Wireless (`AT!...`) | EM7455 (LTE) | RSRP / RSRQ / SINR per antenna, band, bandwidth, channel, TAC, eNodeB/sector, PCI, LTE neighbour cells, temperature, network type and band presets |
 | Icera based sticks (`AT%...`) | Nokia 7M-01 (2G/3G) | GPRS / EDGE / HSPA state, level in dBm, bit error class, LAC, routing area, cell ID, measured cells, home network, firmware parts, network type preference and individual band switches |
+| Plain Qualcomm sticks (`AT$QC...`, `AT*CNTI`, `AT^SYSINFO`) | 4G Systems W1208 (2G/3G/LTE) | System mode and technology, RSCP / Ec/Io on UMTS, RSRP / RSRQ, PCI and channel of LTE cells, LAC or TAC, cell ID, service status, the network's last error report, APN profiles, home network, network type preference, enabled 2G/3G bands (read only) |
 
 The tabs:
 
@@ -17,6 +18,8 @@ The tabs:
 - **Networks** - network search grouped by network type (LTE / UMTS / GSM), manual registration on a chosen
   network (optionally locked to its type), switching back to automatic selection, and the modem's network
   type and band preferences.
+  "APN profiles" on the same tab lists the connection profiles stored in the modem (`AT+CGDCONT`) and lets
+  you add, change and delete them, including the sign-in data on Qualcomm based modems (`AT$QCPDPP`).
 - **Details** - device and SIM identifiers plus everything the modem's status commands report.
 - **AT console** - send any AT command yourself.
 
@@ -42,6 +45,11 @@ The result is `SWTool\bin\Release\SWTool.exe`, a single file with no dependencie
   queue up), shows which command it is waiting for and for how long, and carries on when the answer arrives.
   The port is only reopened when it really disappears. The AT console waits 15 seconds at most; a later
   answer is printed when it comes.
+- APN profile changes are stored in the modem at once, but it only uses them the next time it attaches
+  (register again or restart the modem). A profile that a data connection is using cannot be changed. The
+  modem never reports a stored password, so the editor only rewrites the sign-in data when one of its
+  three fields was changed; passwords are masked in the AT console. Windows may set up profiles of its own
+  when it connects.
 - **Restart modem** is the software equivalent of unplugging it (`AT%IRESET`, `AT!RESET` or `AT+CFUN=1,1`
   depending on the modem). It is sent on the connected port if that still answers, otherwise on another
   AT port of the same device, and SWTool reconnects when the modem is back.
@@ -81,10 +89,35 @@ The result is `SWTool\bin\Release\SWTool.exe`, a single file with no dependencie
 - The other AT ports keep answering while one is blocked, but forcing things from there is not safe:
   `AT+CFUN=4` sent during a registration left that port dead and the modem without service until a restart.
 
+### Plain Qualcomm (4G Systems W1208)
+
+- Its AT port is the "Wireless Modem" device; "Wireless Application" answers AT commands too, "Wireless
+  Application 2" does not accept data at all.
+- The network type preference is read with the standard `+WS46`, but writing that command is acknowledged
+  and ignored. The modem obeys its maker's `+MODODR` (2 automatic, 5 LTE only, 1 UMTS only, 3 GSM only),
+  which SWTool uses; `^SYSCONFIG` is the fallback (no "LTE only") and `+WS46` the last resort.
+- While attached to LTE the modem answers a change of operator with "no network service" within half a
+  second, without trying. SWTool therefore deregisters first (`AT+COPS=2`) when it is on LTE.
+- A registration that names a network type sets the preference to that type only, and it stays that way
+  even when the registration fails, leaving the modem without service. SWTool puts the previous value back
+  after a failed attempt.
+- Input makes the modem drop a registration that is waiting for the network, but unlike the EM7455 it does
+  not return to its previous network afterwards, so SWTool selects that again.
+- `AT+CFUN=1,1` is acknowledged without restarting anything; "Restart modem" uses `AT+CFUN=6`, after which
+  the stick is back on USB in about 35 seconds.
+- `+CEREG` carries a third identifier between tracking area and cell ID ("3102","50","22E4514",7).
+- "Last error reported by the network" (`+CEER`) on the Details tab explains why an attach failed. The test
+  stick could not use LTE because its first APN profile did not belong to the SIM ("Missing or unknown APN").
+- On UMTS the modem prints the levels of the LTE cells it watches divided by ten ("-009.30" for -93 dBm);
+  values outside the physically possible range are scaled back.
+- Bands (`$QCBANDPREF`) are listed but not changed: the command's write syntax is undocumented and it does
+  not cover LTE bands.
+
 ## Source layout
 
 | File | Purpose |
 | --- | --- |
+| `ApnDialog.cs` | The APN profile list and editor |
 | `AtChannel.cs` | Serial port access, one AT command at a time |
 | `ModemPorts.cs` | Finds candidate AT ports via WMI |
 | `Modem.cs` | Modem type detection, polling and the scan / register / preference operations |

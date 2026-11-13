@@ -24,6 +24,7 @@ namespace SWTool
         private ModemStatus last;
         private int tick;
         private string iceraDomain;
+        private string typeCommand = "WS46"; // how a plain Qualcomm modem sets its network type: MODODR, SYSCONFIG or WS46
 
         public void Connect(string port)
         {
@@ -97,12 +98,21 @@ namespace SWTool
             }
             else
             {
-                // Location fields (LAC, cell ID, technology) in the registration answers.
+                // Location fields (LAC or TAC, cell ID, technology) in the registration answers.
                 Query("AT+CREG=2");
                 Query("AT+CGREG=2");
+                if (Kind != ModemKind.Icera) Query("AT+CEREG=2");
             }
 
             if (Kind == ModemKind.Icera) ReadIceraStatic();
+            if (Kind == ModemKind.Qualcomm) ReadQualcommStatic();
+
+            // Connection profiles: which numbers and IP types the modem takes, and whether it keeps sign-in data.
+            ApnIds = new List<int>();
+            ApnTypes = new List<string>();
+            r = Query("AT+CGDCONT=?");
+            if (r.Ok) Parsers.ParseApnLimits(r.Text, ApnIds, ApnTypes);
+            ApnAuth = ApnTypes.Count > 0 && Query("AT$QCPDPP?").Ok;
 
             Query("AT+COPS=3,0"); // operator names in long alphanumeric format
         }
@@ -116,6 +126,8 @@ namespace SWTool
                 && r.Text.IndexOf("NOT IMPLEMENTED", StringComparison.Ordinal) < 0) return ModemKind.Sierra;
             r = Query("AT%IPSYS?");
             if (r.Ok && r.Text.IndexOf("%IPSYS", StringComparison.Ordinal) >= 0) return ModemKind.Icera;
+            r = Query("AT$QCSYSMODE?");
+            if (r.Ok && r.Text.Trim().Length > 0) return ModemKind.Qualcomm;
             return ModemKind.Generic;
         }
 
@@ -196,6 +208,7 @@ namespace SWTool
             bool alive;
             if (Kind == ModemKind.Sierra) alive = PollSierra(s);
             else if (Kind == ModemKind.Icera) alive = PollIceraState(s);
+            else if (Kind == ModemKind.Qualcomm) alive = PollQualcommState(s);
             else alive = true;
 
             AtResponse r = alive ? Query("AT+CSQ") : null;
@@ -216,10 +229,13 @@ namespace SWTool
             RegInfo ps = Parsers.ParseRegInfo(Text(Query("AT+CGREG?")));
             s.RegCs = cs.Stat;
             s.RegPs = ps.Stat;
-            if (Kind == ModemKind.Sierra) s.RegEps = Parsers.ParseReg(Text(Query("AT+CEREG?")));
+            // The Nokia has no LTE and rejects the command.
+            RegInfo eps = Kind == ModemKind.Icera ? new RegInfo() : Parsers.ParseRegInfo(Text(Query("AT+CEREG?")));
+            s.RegEps = eps.Stat;
 
-            if (Kind != ModemKind.Sierra) ApplyLocation(s, cs, ps);
+            if (Kind != ModemKind.Sierra) ApplyLocation(s, cs, ps, eps);
             if (Kind == ModemKind.Icera) PollIceraCells(s);
+            if (Kind == ModemKind.Qualcomm) PollQualcommCells(s);
 
             if (slow)
             {
@@ -238,6 +254,7 @@ namespace SWTool
 
                 if (Kind == ModemKind.Sierra) SlowSierra(s);
                 else if (Kind == ModemKind.Icera) SlowIcera(s);
+                else if (Kind == ModemKind.Qualcomm) SlowQualcomm(s);
                 else SlowGeneric(s);
             }
             else
@@ -292,13 +309,15 @@ namespace SWTool
         }
 
         /// <summary>Fills area code, cell ID and technology from the registration answers (mode 2).</summary>
-        private static void ApplyLocation(ModemStatus s, RegInfo cs, RegInfo ps)
+        private static void ApplyLocation(ModemStatus s, RegInfo cs, RegInfo ps, RegInfo eps)
         {
-            RegInfo loc = ps.Ci.HasValue ? ps : cs;
+            // On LTE the tracking area and cell come with the EPS registration.
+            bool onLte = eps.Ci.HasValue && (eps.Stat == 1 || eps.Stat == 5);
+            RegInfo loc = onLte ? eps : ps.Ci.HasValue ? ps : cs;
             if (loc.Lac.HasValue)
             {
                 s.AreaCode = Parsers.HexDec(loc.Lac.Value, 4);
-                s.AreaCodeName = "LAC";
+                s.AreaCodeName = onLte ? "TAC" : "LAC";
             }
             if (loc.Ci.HasValue)
             {
@@ -480,6 +499,152 @@ namespace SWTool
             return on.Count > 0 ? string.Join(", ", on.ToArray()) : "none";
         }
 
+        // ------------------------------------------------------------ plain Qualcomm (4G Systems W1208 and relatives)
+
+        private void ReadQualcommStatic()
+        {
+            // The network type preference is read with the standard +WS46 (12 GSM, 22 UMTS, 25 automatic,
+            // 28 LTE, ...). Writing it is another matter: the W1208 answers OK to AT+WS46=<n> and ignores
+            // it. What it obeys is its maker's +MODODR (all four types) and the Huawei style ^SYSCONFIG
+            // (no "LTE only"), so the best one the modem has is used.
+            List<int> values = new List<int>();
+            AtResponse r = Query("AT+MODODR=?");
+            if (r.Ok && r.Text.IndexOf("+MODODR", StringComparison.Ordinal) >= 0)
+            {
+                typeCommand = "MODODR";
+                values.AddRange(new[] { 25, 28, 22, 12 });
+            }
+            else if ((r = Query("AT^SYSCONFIG?")).Ok && r.Text.IndexOf("^SYSCONFIG:", StringComparison.Ordinal) >= 0)
+            {
+                typeCommand = "SYSCONFIG";
+                values.AddRange(new[] { 25, 22, 12 });
+            }
+            else
+            {
+                typeCommand = "WS46";
+                r = Query("AT+WS46=?");
+                Match m = r.Ok ? Regex.Match(r.Text, @"\([^)]*\)") : Match.Empty;
+                if (m.Success) values = Parsers.ParseRange(m.Value);
+            }
+            foreach (int value in values)
+            {
+                Choice c = new Choice();
+                c.Index = value.ToString(CultureInfo.InvariantCulture);
+                c.Name = Parsers.Ws46Name(value);
+                RatChoices.Add(c);
+            }
+
+            r = Query("AT+HPLMN");
+            if (r.Ok)
+            {
+                string plmn = FirstMatch(r.Text, @"\d{5,6}");
+                if (plmn != null) staticDetails.Add(Pair("Home network (from SIM)", Parsers.FormatPlmn(plmn)));
+            }
+            r = Query("AT$QCSIMT?");
+            if (r.Ok)
+            {
+                Match m = Regex.Match(r.Text, @"\$QCSIMT:\s*(\S.*)");
+                if (m.Success) staticDetails.Add(Pair("SIM type", m.Groups[1].Value.Trim()));
+            }
+            string hw = Lines(Query("AT$QCHWREV"));
+            if (hw != null) staticDetails.Add(Pair("Hardware revision", hw));
+        }
+
+        private bool PollQualcommState(ModemStatus s)
+        {
+            s.DetailsTitle = "Modem status (Qualcomm $QC commands)";
+            AtResponse r = Query("AT$QCSYSMODE?");
+            if (r.TimedOut) return false;
+            string mode = Lines(r);
+            if (mode != null)
+            {
+                // "WCDMA", "LTE", "GSM", or with a suffix such as "WCDMA - HSDPA and HSUPA".
+                s.SystemMode = mode;
+                s.Details.Add(Pair("System mode ($QCSYSMODE)", mode));
+                string upper = mode.ToUpperInvariant();
+                if (upper.Contains("HSDPA") && upper.Contains("HSUPA")) s.SubTech = "HSPA";
+                else if (upper.Contains("HSDPA")) s.SubTech = "HSDPA";
+                else if (upper.Contains("HSUPA")) s.SubTech = "HSUPA";
+            }
+
+            r = Query("AT*CNTI=0");
+            if (r.Ok) Parsers.ParseCnti(r.Text, s);
+
+            r = Query("AT$QCSQ");
+            if (r.Ok) Parsers.ParseQcsq(r.Text, s);
+            return true;
+        }
+
+        private void PollQualcommCells(ModemStatus s)
+        {
+            // LTE cells first: on LTE the strongest one is the serving cell and supplies PCI, channel and levels.
+            AtResponse rsrp = Query("AT$QCRSRP?");
+            if (rsrp.Ok) Parsers.ParseQcLteCells(rsrp.Text, Text(Query("AT$QCRSRQ?")), s);
+
+            if (s.IsLte || !s.Registered || !s.CellId.HasValue) return;
+            CellInfo serving = new CellInfo();
+            serving.Kind = "Serving cell";
+            serving.Id = s.CellId.Value.ToString(CultureInfo.InvariantCulture);
+            serving.Area = s.lac.HasValue ? s.lac.Value.ToString(CultureInfo.InvariantCulture) : "";
+            double? level = s.IsWcdma ? s.Rscp : s.Rssi;
+            if (level.HasValue) serving.Level = level.Value.ToString("0.#", CultureInfo.InvariantCulture);
+            if (s.IsWcdma && s.Ecio.HasValue) serving.Qual = s.Ecio.Value.ToString("0.#", CultureInfo.InvariantCulture);
+            if (s.IsWcdma && s.Rssi.HasValue) serving.Rssi = s.Rssi.Value.ToString("0.#", CultureInfo.InvariantCulture);
+            s.Cells.Insert(0, serving);
+        }
+
+        private void SlowQualcomm(ModemStatus s)
+        {
+            List<KeyValuePair<string, string>> d = s.slowDetails;
+
+            AtResponse r = Query("AT+WS46?");
+            if (r.Ok)
+            {
+                string value = FirstMatch(r.Text, @"\d+");
+                if (value != null)
+                {
+                    s.RatPrefIndex = value;
+                    s.RatPrefName = Parsers.Ws46Name(int.Parse(value, CultureInfo.InvariantCulture));
+                }
+            }
+
+            r = Query("AT$QCBANDPREF?");
+            if (r.Ok)
+            {
+                s.BandPrefName = Parsers.ParseQcBands(r.Text);
+                if (s.BandPrefName != null) d.Add(Pair("Enabled 2G / 3G bands", s.BandPrefName));
+            }
+
+            r = Query("AT^SYSINFO");
+            if (r.Ok) Parsers.ParseSysInfo(r.Text, d);
+
+            // Why the last attach or registration failed, e.g. "Missing or unknown APN" keeps a modem off LTE.
+            r = Query("AT+CEER");
+            if (r.Ok)
+            {
+                Match m = Regex.Match(r.Text, @"\+CEER:\s*(\S.*)");
+                if (m.Success) d.Add(Pair("Last error reported by the network", m.Groups[1].Value.Trim()));
+            }
+
+            ReadRadioAndAttach(s);
+
+            string contexts = Text(Query("AT+CGDCONT?"));
+            string list = Parsers.ContextList(contexts);
+            if (list != null) d.Add(Pair("APN profiles", list));
+
+            r = Query("AT+CGCONTRDP");
+            if (r.Ok && r.Text.IndexOf("+CGCONTRDP", StringComparison.Ordinal) >= 0)
+            {
+                Parsers.ParseContext(r.Text, s);
+                return;
+            }
+            r = Query("AT+CGACT?");
+            string cid = r.Ok ? Parsers.ActiveContext(r.Text) : null;
+            if (cid == null) return;
+            s.Apn = Parsers.ApnOfContext(contexts, cid);
+            s.Ipv4 = Parsers.AddressOfContext(Text(Query("AT+CGPADDR=" + cid)), cid);
+        }
+
         // ------------------------------------------------------------ standard commands only
 
         private void SlowGeneric(ModemStatus s)
@@ -541,14 +706,32 @@ namespace SWTool
         }
 
         /// <summary>
-        /// How long to wait for a registration. A Sierra modem never answers when the network refuses the
-        /// SIM, but lets go when interrupted, so it gets a limit. Other modems (seen on the Nokia 7M-01)
-        /// answer by themselves after up to about 100 s, block their port until then and cannot be
-        /// interrupted on it, so there is no point in giving up early.
+        /// Qualcomm based modems (EM7455, W1208) drop a registration that is still waiting for the
+        /// network as soon as anything is sent to them.
+        /// </summary>
+        private bool AbortsOnInput
+        {
+            get { return Kind == ModemKind.Sierra || Kind == ModemKind.Qualcomm; }
+        }
+
+        /// <summary>
+        /// Whether a registration that names a network type also rewrites the modem's network type
+        /// preference to that type only (!SELRAT on the EM7455, +WS46 on the W1208).
+        /// </summary>
+        public bool RegistrationSetsTypePreference
+        {
+            get { return Kind == ModemKind.Sierra || Kind == ModemKind.Qualcomm; }
+        }
+
+        /// <summary>
+        /// How long to wait for a registration. A Qualcomm based modem never answers when the network
+        /// refuses the SIM, but lets go when interrupted, so it gets a limit. Other modems (seen on the
+        /// Nokia 7M-01) answer by themselves after up to about 100 s, block their port until then and
+        /// cannot be interrupted on it, so there is no point in giving up early.
         /// </summary>
         private int RegisterTimeoutMs
         {
-            get { return Kind == ModemKind.Sierra ? 100000 : 300000; }
+            get { return AbortsOnInput ? 100000 : 300000; }
         }
 
         /// <summary>
@@ -567,6 +750,12 @@ namespace SWTool
             cancelRequested = false;
             int previousMode = last != null ? last.CopsMode : -1;
             string previousPlmn = last != null ? last.Plmn : null;
+            string previousType = last != null ? last.RatPrefIndex : null;
+
+            // While it is attached to LTE the W1208 answers a change of operator with "no network service"
+            // within half a second, without trying. After an explicit deregistration the same command works.
+            if (Kind == ModemKind.Qualcomm && last != null && last.IsLte && last.Registered && last.Plmn != plmn)
+                At.Send("AT+COPS=2", 30000);
 
             RegisterResult res = new RegisterResult();
             AtResponse r = At.Send("AT+COPS=1,2,\"" + plmn + "\"", RegisterTimeoutMs);
@@ -585,7 +774,7 @@ namespace SWTool
             }
 
             res.Cancelled = cancelRequested;
-            if (!res.Success) RestoreSelection(res, plmn, previousMode, previousPlmn);
+            if (!res.Success) RestoreSelection(res, plmn, previousMode, previousPlmn, previousType);
 
             if (At.PendingCommand == null) Query("AT+COPS=3,0");
             InvalidateSlowItems();
@@ -593,40 +782,112 @@ namespace SWTool
         }
 
         /// <summary>Puts the network selection back after a registration that failed or was cancelled.</summary>
-        private void RestoreSelection(RegisterResult res, string plmn, int previousMode, string previousPlmn)
+        private void RestoreSelection(RegisterResult res, string plmn, int previousMode, string previousPlmn, string previousType)
         {
-            if (Kind == ModemKind.Sierra)
+            if (AbortsOnInput && At.PendingCommand != null)
             {
-                // Any input makes the modem drop the attempt and return to its previous network by itself.
-                if (At.PendingCommand != null)
-                {
-                    At.Interrupt();
-                    At.WaitIdle(6000);
-                }
-                res.Reverted = At.PendingCommand == null && !res.OperatorSelected;
-                res.StillPending = At.PendingCommand != null;
-                return;
+                At.Interrupt();
+                At.WaitIdle(6000);
             }
-
             if (At.PendingCommand != null)
             {
                 res.StillPending = true; // nothing can be sent on this port until the modem answers
                 return;
             }
-            if (res.OperatorSelected) return; // only the type lock failed; the operator selection stands
+
+            if (Kind == ModemKind.Sierra)
+            {
+                // Once it has dropped the attempt, the EM7455 returns to its previous network by itself.
+                res.Reverted = !res.OperatorSelected;
+                return;
+            }
+
+            if (res.OperatorSelected)
+            {
+                // Only the type lock failed. The W1208 keeps the type restriction it could not honour
+                // (+WS46 stays on e.g. "LTE only") and is then without service, so undo that and select
+                // the operator again without a type.
+                if (Kind == ModemKind.Qualcomm)
+                {
+                    RestoreTypePreference(previousType);
+                    At.Send("AT+COPS=1,2,\"" + plmn + "\"", RegisterTimeoutMs);
+                }
+                return;
+            }
 
             // These modems stay in manual mode on the network that refused them, without service.
+            if (Kind == ModemKind.Qualcomm) RestoreTypePreference(previousType);
             AtResponse back = previousMode == 1 && !string.IsNullOrEmpty(previousPlmn) && previousPlmn != plmn
                 ? At.Send("AT+COPS=1,2,\"" + previousPlmn + "\"", RegisterTimeoutMs)
                 : At.Send("AT+COPS=0", 30000);
             res.Reverted = back.Ok;
         }
 
+        /// <summary>Sets the network type preference back to the given +WS46 value if a registration attempt changed it.</summary>
+        private void RestoreTypePreference(string previous)
+        {
+            if (string.IsNullOrEmpty(previous)) return;
+            string now = FirstMatch(Text(Query("AT+WS46?")), @"\d+");
+            if (now != null && now != previous) SetQualcommType(previous);
+        }
+
+        /// <summary>
+        /// Sets the network type preference of a plain Qualcomm modem, given as a +WS46 value, and
+        /// checks that it took effect.
+        /// </summary>
+        private AtResponse SetQualcommType(string ws46)
+        {
+            AtResponse r;
+            if (typeCommand == "MODODR")
+            {
+                // +MODODR=<n>: 2 automatic, 5 LTE only, 1 UMTS only, 3 GSM only (it reads back 15 and 13 for the last two).
+                string mode = ws46 == "25" ? "2" : ws46 == "28" ? "5" : ws46 == "22" ? "1" : ws46 == "12" ? "3" : null;
+                if (mode == null)
+                {
+                    r = new AtResponse();
+                    r.Command = "AT+MODODR";
+                    r.Result = "This modem cannot be set to that network type directly.";
+                    return r;
+                }
+                r = At.Send("AT+MODODR=" + mode, 20000);
+            }
+            else if (typeCommand == "SYSCONFIG")
+            {
+                // ^SYSCONFIG=<mode>,<acquisition order>,<roaming>,<service domain>: 2 automatic, 13 GSM only,
+                // 14 UMTS only. The other three values are sent back as they are.
+                string mode = ws46 == "25" ? "2" : ws46 == "22" ? "14" : ws46 == "12" ? "13" : null;
+                Match now = Regex.Match(Text(Query("AT^SYSCONFIG?")), @"\^SYSCONFIG:\s*\d+\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)");
+                if (mode == null || !now.Success)
+                {
+                    r = new AtResponse();
+                    r.Command = "AT^SYSCONFIG";
+                    r.Result = mode == null ? "This modem cannot be set to that network type directly."
+                        : "The modem did not report its current configuration.";
+                    return r;
+                }
+                r = At.Send("AT^SYSCONFIG=" + mode + "," + now.Groups[1].Value + "," + now.Groups[2].Value + "," + now.Groups[3].Value, 20000);
+            }
+            else
+            {
+                r = At.Send("AT+WS46=" + ws46, 20000);
+            }
+            if (r.Ok)
+            {
+                string after = FirstMatch(Text(Query("AT+WS46?")), @"\d+");
+                if (after != null && after != ws46)
+                {
+                    r.Ok = false;
+                    r.Result = "OK, but the modem still reports its previous setting.";
+                }
+            }
+            return r;
+        }
+
         public AtResponse RegisterAutomatic()
         {
             cancelRequested = false;
             AtResponse r = At.Send("AT+COPS=0", RegisterTimeoutMs);
-            if (r.TimedOut && Kind == ModemKind.Sierra)
+            if (r.TimedOut && AbortsOnInput)
             {
                 At.Interrupt();
                 At.WaitIdle(6000);
@@ -656,7 +917,9 @@ namespace SWTool
         /// </summary>
         public string Restart()
         {
-            string command = Kind == ModemKind.Icera ? "AT%IRESET" : Kind == ModemKind.Sierra ? "AT!RESET" : "AT+CFUN=1,1";
+            // The W1208 acknowledges the standard AT+CFUN=1,1 without restarting; Qualcomm's own mode 6 does it.
+            string command = Kind == ModemKind.Icera ? "AT%IRESET" : Kind == ModemKind.Sierra ? "AT!RESET"
+                : Kind == ModemKind.Qualcomm ? "AT+CFUN=6" : "AT+CFUN=1,1";
             if (CanCancel) At.Interrupt(); // lets a running search or registration go first
 
             string refusal = null;
@@ -704,12 +967,63 @@ namespace SWTool
             At.Report(r, false);
         }
 
+        // ============================================================ APN profiles
+
+        /// <summary>Profile numbers the modem accepts for AT+CGDCONT (empty if it has no stored profiles).</summary>
+        public List<int> ApnIds = new List<int>();
+        /// <summary>IP types the modem accepts: IP, IPV6, IPV4V6.</summary>
+        public List<string> ApnTypes = new List<string>();
+        /// <summary>The modem keeps authentication data per profile (Qualcomm's $QCPDPP).</summary>
+        public bool ApnAuth;
+
+        public bool SupportsApnProfiles { get { return ApnTypes.Count > 0; } }
+
+        public List<ApnProfile> ReadApnProfiles()
+        {
+            AtResponse defined = At.Send("AT+CGDCONT?", 5000);
+            if (!defined.Ok) throw new InvalidOperationException("The modem did not list its profiles: " + defined.Result);
+            string active = Text(Query("AT+CGACT?"));
+            string auth = ApnAuth ? Text(Query("AT$QCPDPP?")) : "";
+            return Parsers.ParseApnProfiles(defined.Text, active, auth);
+        }
+
+        /// <summary>
+        /// Writes a profile. Authentication is only touched when <paramref name="setAuth"/> is true,
+        /// because the modem never reports the stored password and it would otherwise be lost.
+        /// </summary>
+        public AtResponse SaveApnProfile(ApnProfile p, bool setAuth, string password)
+        {
+            AtResponse r = At.Send("AT+CGDCONT=" + p.Id.ToString(CultureInfo.InvariantCulture)
+                + ",\"" + p.Type + "\",\"" + p.Apn + "\"", 15000);
+            if (r.Ok && setAuth && ApnAuth)
+            {
+                // $QCPDPP=<profile>,<auth type>[,<password>,<user name>]
+                string head = "AT$QCPDPP=" + p.Id.ToString(CultureInfo.InvariantCulture) + "," + p.Auth.ToString(CultureInfo.InvariantCulture);
+                r = p.Auth == 0
+                    ? At.Send(head, 15000)
+                    : At.Send(head + ",\"" + password + "\",\"" + p.User + "\"", 15000, false, head + ",\"***\",\"" + p.User + "\"");
+            }
+            InvalidateSlowItems();
+            return r;
+        }
+
+        public AtResponse DeleteApnProfile(int id)
+        {
+            AtResponse r = At.Send("AT+CGDCONT=" + id.ToString(CultureInfo.InvariantCulture), 15000);
+            InvalidateSlowItems();
+            return r;
+        }
+
         // ============================================================ preferences
 
         public AtResponse SetRatPreference(string index)
         {
             AtResponse r;
-            if (Kind == ModemKind.Icera)
+            if (Kind == ModemKind.Qualcomm)
+            {
+                r = SetQualcommType(index);
+            }
+            else if (Kind == ModemKind.Icera)
             {
                 // Keep the service domain (second value) as it is; only the network type changes.
                 r = At.Send("AT%IPSYS=" + index + (iceraDomain != null ? "," + iceraDomain : ""), 20000);
