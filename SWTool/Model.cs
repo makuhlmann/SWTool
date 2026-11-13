@@ -13,15 +13,60 @@ namespace SWTool
         public double? Rsrp;
     }
 
+    /// <summary>Command dialects the tool knows. Everything else is handled with standard 3GPP commands only.</summary>
+    public enum ModemKind { Generic, Sierra, Icera }
+
     public sealed class CellInfo
     {
         public string Kind = "";
         public string Channel = "";
         public string Band = "";
-        public string Id = "";      // PCI or PSC
-        public string Level = "";   // RSRP or RSCP
+        public string Id = "";      // PCI, PSC or GSM cell identity
+        public string Area = "";    // LAC where known
+        public string Level = "";   // RSRP, RSCP or GSM receive level
         public string Qual = "";    // RSRQ or Ec/N0
         public string Rssi = "";
+    }
+
+    /// <summary>Fields of a +CREG / +CGREG answer. Location fields are only present in reporting mode 2.</summary>
+    public sealed class RegInfo
+    {
+        public int Stat = -1;
+        public long? Lac, Ci;
+        public int Act = -1;
+        public string Rac;
+    }
+
+    /// <summary>One radio band that can be switched on or off individually (Icera modems).</summary>
+    public sealed class BandToggle
+    {
+        public string Id = "";
+        public bool Enabled;
+
+        public string Name
+        {
+            get
+            {
+                switch (Id)
+                {
+                    case "ANY": return "All bands (automatic)";
+                    case "EGSM": return "GSM 900";
+                    case "DCS": return "GSM 1800";
+                    case "PCS": return "GSM 1900";
+                    case "G850": return "GSM 850";
+                    case "FDD_BAND_I": return "UMTS 2100 (band 1)";
+                    case "FDD_BAND_II": return "UMTS 1900 (band 2)";
+                    case "FDD_BAND_III": return "UMTS 1800 (band 3)";
+                    case "FDD_BAND_IV": return "UMTS 1700/2100 AWS (band 4)";
+                    case "FDD_BAND_V": return "UMTS 850 (band 5)";
+                    case "FDD_BAND_VI": return "UMTS 800 (band 6)";
+                    case "FDD_BAND_VIII": return "UMTS 900 (band 8)";
+                    default: return Id;
+                }
+            }
+        }
+
+        public override string ToString() { return Name; }
     }
 
     public sealed class NetworkEntry
@@ -56,6 +101,13 @@ namespace SWTool
         public bool LockRequested;
         public bool TypeLocked;
 
+        /// <summary>The user cancelled the attempt.</summary>
+        public bool Cancelled;
+        /// <summary>After a failed attempt the modem is back on the selection it had before.</summary>
+        public bool Reverted;
+        /// <summary>The modem has still not answered; its port stays blocked until it does.</summary>
+        public bool StillPending;
+
         public bool Success { get { return OperatorSelected && (!LockRequested || TypeLocked); } }
     }
 
@@ -70,6 +122,21 @@ namespace SWTool
     public sealed class DeviceInfo
     {
         public string Manufacturer, Model, Revision, Imei, Serial, Imsi, Iccid, OwnNumber;
+
+        /// <summary>The version number out of the firmware string, for places with little room.</summary>
+        public string ShortRevision
+        {
+            get
+            {
+                if (string.IsNullOrEmpty(Revision)) return null;
+                // Either "SWI9X30C_02.33.03.00 r8209 ..." or several parts such as "Modem mode, 7M-01 M2.2.0, P4 rev: ...".
+                string[] parts = Revision.Split(new[] { ", " }, StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length == 1) return parts[0].Split(' ')[0];
+                foreach (string p in parts)
+                    if (System.Text.RegularExpressions.Regex.IsMatch(p, @"\d+\.\d+")) return p;
+                return parts[0];
+            }
+        }
     }
 
     /// <summary>One snapshot of everything the poller read from the modem.</summary>
@@ -77,6 +144,9 @@ namespace SWTool
     {
         public DateTime Time = DateTime.Now;
         public bool Responding = true;
+        /// <summary>When not responding: the command the modem is still working on, and for how long.</summary>
+        public string BusyCommand;
+        public int BusySeconds;
         public bool HasGStatus;
 
         public string OperatorName, Plmn;
@@ -92,9 +162,22 @@ namespace SWTool
 
         public double? Temperature, Rssi, Rsrp, Rsrq, Sinr, Rscp, Ecio, TxPower;
         public int? Csq;
+        /// <summary>GSM bit error class (RXQUAL 0 best to 7 worst) from +CSQ, if the modem reports one.</summary>
+        public int? Ber;
+        /// <summary>Refinement of the network type: GPRS, EDGE, HSDPA, HSUPA, HSPA, HSPA+ or null.</summary>
+        public string SubTech;
+        public string Rac;
 
         public string Apn, Ipv4, Ipv6;
         public string RatPrefIndex, RatPrefName, BandPrefIndex, BandPrefName;
+        /// <summary>Individually switchable bands, or null if the modem has none.</summary>
+        public List<BandToggle> Bands;
+        /// <summary>Heading for <see cref="Details"/> on the Details page.</summary>
+        public string DetailsTitle = "Modem status";
+
+        // Working data of the poller: detail rows that are only re-read on slow ticks, and the numeric LAC.
+        internal readonly List<KeyValuePair<string, string>> slowDetails = new List<KeyValuePair<string, string>>();
+        internal long? lac;
 
         public readonly List<RxPath> Paths = new List<RxPath>();
         public readonly List<KeyValuePair<string, string>> Details = new List<KeyValuePair<string, string>>();
@@ -185,8 +268,8 @@ namespace SWTool
                         && CaState.IndexOf("INACTIVE", StringComparison.OrdinalIgnoreCase) < 0;
                     return ca ? "LTE-A (4G+, carrier aggregation)" : "LTE (4G)";
                 }
-                if (IsWcdma) return "UMTS / HSPA (3G)";
-                if (IsGsm) return "GSM (2G)";
+                if (IsWcdma) return SubTech != null ? "UMTS / " + SubTech + " (3G)" : "UMTS (3G)";
+                if (IsGsm) return SubTech != null ? "GSM / " + SubTech + " (2G)" : "GSM (2G)";
                 return string.IsNullOrEmpty(SystemMode) ? "Unknown" : SystemMode;
             }
         }
@@ -226,6 +309,14 @@ namespace SWTool
         public static Quality Rssi(double? v) { return Rate(v, -65, -75, -85, -95); }
         public static Quality Rscp(double? v) { return Rate(v, -70, -85, -95, -105); }
         public static Quality Ecio(double? v) { return Rate(v, -6, -10, -14, -18); }
+
+        /// <summary>GSM RXQUAL class: 0 is error free, 7 is unusable.</summary>
+        public static Quality RxQual(int? v)
+        {
+            if (!v.HasValue) return Quality.Unknown;
+            return v <= 1 ? Quality.Excellent : v <= 3 ? Quality.Good : v == 4 ? Quality.Fair
+                : v == 5 ? Quality.Poor : Quality.VeryPoor;
+        }
 
         public static Quality FromBars(int bars)
         {

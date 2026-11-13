@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Globalization;
+using System.IO;
 using System.Text;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -18,7 +19,12 @@ namespace SWTool
         private readonly Timer timer = new Timer();
         private bool connected, polling, busy, userDisconnected, closing, sending;
         private volatile bool logPolling;
-        private int intervalMs = 2000, silentPolls;
+        private int intervalMs = 2000;
+        // modemBusy: the modem is still working on a command and takes nothing new (see AtChannel).
+        private bool modemBusy, registering, cancelling, restarting;
+        private Button restartButton;
+        private string busyText;
+        private DateTime busyStart;
         private DateTime nextPoll = DateTime.MinValue, nextReconnect = DateTime.MinValue;
         private string currentPort, chartMode, shownRat, shownBand;
         private ModemStatus status;
@@ -35,11 +41,13 @@ namespace SWTool
         private TextBox consoleOut, consoleIn;
         private CheckBox showPolling, lockType;
         private Font boldListFont;
+        private Button bandsButton;
+        private Label bandsLabel, bandsCaption, cellsInfo;
         private ToolStripStatusLabel statusLabel, updatedLabel;
 
         public MainForm()
         {
-            Text = "SWTool - Sierra Wireless modem monitor";
+            Text = "SWTool - mobile broadband modem monitor";
             Font = new Font("Segoe UI", 9f);
             AutoScaleDimensions = new SizeF(96f, 96f);
             AutoScaleMode = AutoScaleMode.Dpi;
@@ -112,7 +120,7 @@ namespace SWTool
 
             portCombo = new ComboBox();
             portCombo.DropDownStyle = ComboBoxStyle.DropDownList;
-            portCombo.Width = 450;
+            portCombo.Width = 360;
             portCombo.Margin = new Padding(3, 4, 3, 3);
 
             portsButton = MakeButton("Rescan ports", async delegate { await RefreshPortsAsync(false); });
@@ -133,9 +141,12 @@ namespace SWTool
 
             bar.Controls.Add(MakeLabel("AT port:"));
             bar.Controls.Add(portCombo);
+            restartButton = MakeButton("Restart modem", OnRestartClick);
+
             bar.Controls.Add(connectButton);
             bar.Controls.Add(portsButton);
-            bar.Controls.Add(MakeLabel("    Refresh every:"));
+            bar.Controls.Add(restartButton);
+            bar.Controls.Add(MakeLabel("  Refresh:"));
             bar.Controls.Add(intervalCombo);
             return bar;
         }
@@ -254,18 +265,16 @@ namespace SWTool
             TabPage page = new TabPage("Cells");
             page.UseVisualStyleBackColor = true;
             page.Padding = new Padding(6);
-            neighbourList = MakeList("Cell", "210", "Channel", "80", "Band", "60", "PCI / PSC", "80",
-                "RSRP / RSCP (dBm)", "120", "RSRQ / EcN0 (dB)", "120", "RSSI (dBm)", "90");
+            neighbourList = MakeList("Cell", "200", "Channel", "70", "Band", "50", "PCI / PSC / cell ID", "120",
+                "Area (LAC)", "80", "RSRP / RSCP / level (dBm)", "150", "RSRQ / EcN0 (dB)", "110", "RSSI (dBm)", "80");
 
-            Label info = new Label();
-            info.Dock = DockStyle.Bottom;
-            info.AutoSize = false;
-            info.Height = 38;
-            info.ForeColor = Color.FromArgb(0x55, 0x55, 0x55);
-            info.Text = "The serving cell and the neighbour cells the modem currently measures (AT!LTEINFO). "
-                + "Neighbours are only reported while connected to LTE and may be empty when the serving cell is strong.";
+            cellsInfo = new Label();
+            cellsInfo.Dock = DockStyle.Bottom;
+            cellsInfo.AutoSize = false;
+            cellsInfo.Height = 38;
+            cellsInfo.ForeColor = Color.FromArgb(0x55, 0x55, 0x55);
             page.Controls.Add(neighbourList);
-            page.Controls.Add(info);
+            page.Controls.Add(cellsInfo);
             return page;
         }
 
@@ -279,7 +288,7 @@ namespace SWTool
             top.AutoSize = true;
             top.WrapContents = false;
             scanButton = MakeButton("Search for networks", OnScanClick);
-            scanInfo = MakeLabel("A search takes 30 seconds to 2 minutes. Data transfer may pause while it runs; Disconnect aborts it.");
+            scanInfo = MakeLabel("A search takes 30 seconds to 2 minutes. Data transfer may pause while it runs.");
             top.Controls.Add(scanButton);
             top.Controls.Add(scanInfo);
 
@@ -288,7 +297,7 @@ namespace SWTool
             networkList.MultiSelect = false;
             networkList.ShowGroups = true;
             networkList.SelectedIndexChanged += delegate { UpdateEnabled(); };
-            networkList.DoubleClick += OnRegisterClick;
+            networkList.DoubleClick += delegate(object s, EventArgs e) { if (!registering) OnRegisterClick(s, e); };
 
             FlowLayoutPanel actions = new FlowLayoutPanel();
             actions.Dock = DockStyle.Fill;
@@ -329,12 +338,18 @@ namespace SWTool
             bandCombo.Margin = new Padding(3, 4, 3, 3);
             bandCombo.SelectedIndexChanged += delegate { UpdateEnabled(); };
             bandApply = MakeButton("Apply", OnBandApplyClick);
+            // Modems with individually switchable bands get a dialog instead of the preset list.
+            bandsButton = MakeButton("Choose...", OnBandsClick);
+            bandsLabel = MakeLabel("");
+            bandsCaption = MakeLabel("      Bands:");
             prefFlow.Controls.Add(MakeLabel("Network type:"));
             prefFlow.Controls.Add(ratCombo);
             prefFlow.Controls.Add(ratApply);
-            prefFlow.Controls.Add(MakeLabel("      Bands:"));
+            prefFlow.Controls.Add(bandsCaption);
             prefFlow.Controls.Add(bandCombo);
             prefFlow.Controls.Add(bandApply);
+            prefFlow.Controls.Add(bandsButton);
+            prefFlow.Controls.Add(bandsLabel);
             prefs.Controls.Add(prefFlow);
 
             TableLayoutPanel root = new TableLayoutPanel();
@@ -549,7 +564,7 @@ namespace SWTool
                 if (closing) return;
                 connected = true;
                 currentPort = port;
-                silentPolls = 0;
+                modemBusy = false;
                 shownRat = shownBand = null;
                 SaveSetting("Port", port);
                 FillChoices();
@@ -584,7 +599,7 @@ namespace SWTool
         private string DeviceSuffix()
         {
             DeviceInfo d = modem.Device;
-            return string.IsNullOrEmpty(d.Model) ? "" : "  -  " + d.Model + (string.IsNullOrEmpty(d.Revision) ? "" : ", firmware " + d.Revision.Split(' ')[0]);
+            return string.IsNullOrEmpty(d.Model) ? "" : "  -  " + d.Model + (string.IsNullOrEmpty(d.Revision) ? "" : ", firmware " + d.ShortRevision);
         }
 
         private static string Friendly(Exception ex)
@@ -618,36 +633,72 @@ namespace SWTool
 
         private void UpdateEnabled()
         {
-            bool idle = connected && !busy;
+            bool idle = connected && !busy && !modemBusy;
             bool waiting = Retrying;
             connectButton.Text = connected ? "Disconnect" : waiting ? "Stop retrying" : "Connect";
             connectButton.Enabled = connected || (!busy && (waiting || portCombo.SelectedItem != null));
             portCombo.Enabled = !connected && !busy;
+            // While a search or registration runs, its own button cancels it.
+            // A search cannot be interrupted (the EM7455 ignores input until it is done).
+            bool canCancel = modem.CanCancel;
             scanButton.Enabled = idle;
             autoButton.Enabled = idle;
-            registerButton.Enabled = idle && networkList.SelectedItems.Count == 1;
+            registerButton.Text = registering && canCancel ? "Cancel registration" : "Register on selected network";
+            registerButton.Enabled = registering ? canCancel && !cancelling : idle && networkList.SelectedItems.Count == 1;
+            restartButton.Enabled = connected && !restarting;
             lockType.Enabled = idle;
             ratCombo.Enabled = idle && ratCombo.Items.Count > 0;
             bandCombo.Enabled = idle && bandCombo.Items.Count > 0;
             ratApply.Enabled = idle && ratCombo.SelectedItem != null;
             bandApply.Enabled = idle && bandCombo.SelectedItem != null;
+            bandsButton.Enabled = idle && status != null && status.Bands != null;
             sendButton.Enabled = connected && !sending;
         }
 
+        /// <summary>Adapts the preference controls and hints to the kind of modem that was just connected.</summary>
         private void FillChoices()
         {
             ratCombo.Items.Clear();
             foreach (Choice c in modem.RatChoices) ratCombo.Items.Add(c);
             bandCombo.Items.Clear();
             foreach (Choice c in modem.BandChoices) bandCombo.Items.Add(c);
+
+            bool presets = modem.BandChoices.Count > 0;
+            bool toggles = modem.Kind == ModemKind.Icera;
+            bandsCaption.Visible = presets || toggles;
+            bandCombo.Visible = bandApply.Visible = presets;
+            bandsButton.Visible = bandsLabel.Visible = toggles;
+            bandsLabel.Text = "";
+
+            switch (modem.Kind)
+            {
+                case ModemKind.Sierra:
+                    cellsInfo.Text = "The serving cell and the neighbour cells the modem currently measures (AT!LTEINFO). "
+                        + "Neighbours are only reported while connected to LTE and may be empty when the serving cell is strong.";
+                    break;
+                case ModemKind.Icera:
+                    cellsInfo.Text = "The serving cell (from the registration info) and the cells the modem currently measures (AT%INCELL), "
+                        + "strongest first. This modem reports no channel numbers, and a cell ID only once it has read that cell's broadcast info.";
+                    break;
+                default:
+                    cellsInfo.Text = "This modem does not report cell measurements through standard AT commands.";
+                    break;
+            }
         }
 
         // ============================================================ polling
 
         private async void OnTimer(object sender, EventArgs e)
         {
-            if (closing || polling || busy) return;
+            if (closing) return;
             DateTime now = DateTime.Now;
+            if (busy)
+            {
+                // Long operations show how long they have been running.
+                if (busyText != null) statusLabel.Text = busyText + "  (" + (int)(now - busyStart).TotalSeconds + " s)";
+                return;
+            }
+            if (polling) return;
 
             if (!connected)
             {
@@ -668,13 +719,15 @@ namespace SWTool
                 if (closing || !connected) return;
                 if (!s.Responding)
                 {
-                    if (++silentPolls >= 3) ConnectionLost(new TimeoutException("the modem stopped answering"));
-                    else SetStatus("The modem is not responding...");
+                    ShowModemBusy(s);
                     return;
                 }
-                if (silentPolls > 0 || statusLabel.Text.StartsWith("The modem is not", StringComparison.Ordinal))
+                if (modemBusy)
+                {
+                    modemBusy = false;
                     SetStatus("Connected to " + currentPort + DeviceSuffix());
-                silentPolls = 0;
+                    UpdateEnabled();
+                }
                 ShowStatus(s);
             }
             catch (OperationCanceledException) { }
@@ -688,11 +741,32 @@ namespace SWTool
             }
         }
 
+        /// <summary>
+        /// The modem has not answered a command yet. Reopening the port would not help (a busy modem
+        /// ignores it), so this only reports the fact and waits; polling resumes by itself.
+        /// </summary>
+        private void ShowModemBusy(ModemStatus s)
+        {
+            bool known = !string.IsNullOrEmpty(s.BusyCommand);
+            string time = "  (" + s.BusySeconds + " s)";
+            header.Set(0, Color.Gray, known ? "Modem busy" : "Modem not answering",
+                known ? "Still working on:  " + s.BusyCommand + time : "",
+                "Its port answers again when it is done. If it stays like this for minutes, use Restart modem.");
+            SetStatus(known ? "Waiting for the modem to finish " + s.BusyCommand + time : "The modem is not answering");
+            if (!modemBusy)
+            {
+                modemBusy = true;
+                UpdateEnabled();
+            }
+        }
+
         /// <summary>Runs a long modem operation while the poller is paused and the action buttons are disabled.</summary>
         private async Task<T> RunBusy<T>(string statusText, Func<T> operation)
         {
             string previous = statusLabel.Text;
             busy = true;
+            busyText = statusText;
+            busyStart = DateTime.Now;
             UpdateEnabled();
             SetStatus(statusText);
             UseWaitCursor = true;
@@ -704,9 +778,10 @@ namespace SWTool
             {
                 UseWaitCursor = false;
                 busy = false;
+                busyText = null;
                 if (!closing)
                 {
-                    if (statusLabel.Text == statusText) SetStatus(previous);
+                    if (statusLabel.Text.StartsWith(statusText, StringComparison.Ordinal)) SetStatus(previous);
                     nextPoll = DateTime.Now;
                     UpdateEnabled();
                 }
@@ -796,7 +871,9 @@ namespace SWTool
             else
             {
                 meters[0].Set("RSSI", "Received signal strength", s.Rssi, "dBm", -113, -51, Rating.Rssi(s.Rssi));
-                SetMeterCount(1);
+                // GSM bit error class: 0 is error free, 7 unusable, so the bar runs the other way round.
+                meters[1].Set("RxQual", "Bit error class", s.Ber, "", 7, 0, Rating.RxQual(s.Ber));
+                SetMeterCount(s.Ber.HasValue ? 2 : 1);
                 chart.Add(s.Time, s.Rssi, null);
             }
 
@@ -819,6 +896,7 @@ namespace SWTool
             AddRow(rows, "Operator ID (PLMN)", PlmnText(s));
             AddRow(rows, "Registration", s.RegText);
             AddRow(rows, s.AreaCodeName == "LAC" ? "Location area (LAC)" : "Tracking area (TAC)", s.AreaCode);
+            AddRow(rows, "Routing area (RAC)", s.Rac);
             AddRow(rows, "Cell ID", s.CellIdText);
             if (s.CellId.HasValue && lte)
                 AddRow(rows, "eNodeB / sector", (s.CellId.Value >> 8).ToString(inv) + " / " + (s.CellId.Value & 0xFF).ToString(inv));
@@ -833,13 +911,22 @@ namespace SWTool
             AddRow(rows, "IPv6 address", s.Ipv6);
             if (s.TxPower.HasValue) AddRow(rows, "Transmit power", Parsers.Fmt(s.TxPower, "dBm"));
             if (s.Temperature.HasValue) AddRow(rows, "Module temperature", s.Temperature.Value.ToString("0.#", inv) + " °C");
+            if (modem.Kind != ModemKind.Sierra)
+            {
+                // These modems report less about the cell, so there is room for the settings that shape the connection.
+                AddRow(rows, "Network selection", SelectionText(s));
+                AddRow(rows, "Preferred network type", s.RatPrefName);
+                AddRow(rows, "Enabled bands", s.BandPrefName);
+                if (s.Csq.HasValue) AddRow(rows, "Signal (AT+CSQ)", s.Csq.Value + " of 31");
+            }
             cellList.SetRows(rows, null);
 
             // ---- neighbour cells
             List<string[]> cells = new List<string[]>();
             foreach (CellInfo c in s.Cells)
-                cells.Add(new[] { c.Kind, c.Channel, c.Band, c.Id, c.Level, c.Qual, c.Rssi });
+                cells.Add(new[] { c.Kind, c.Channel, c.Band, c.Id, c.Area, c.Level, c.Qual, c.Rssi });
             neighbourList.SetRows(cells, null);
+            if (s.Bands != null && bandsLabel.Text != (s.BandPrefName ?? "")) bandsLabel.Text = s.BandPrefName ?? "";
 
             ShowDetails(s);
 
@@ -918,7 +1005,8 @@ namespace SWTool
                 groups.Add(g);
             };
 
-            const string gd = "Device and SIM", gn = "Network", gs = "Modem status (AT!GSTATUS?)";
+            const string gd = "Device and SIM", gn = "Network";
+            string gs = s.DetailsTitle;
             add(gd, "Manufacturer", d.Manufacturer);
             add(gd, "Model", d.Model);
             add(gd, "Firmware", d.Revision);
@@ -980,8 +1068,8 @@ namespace SWTool
 
         private async void OnScanClick(object sender, EventArgs e)
         {
-            if (!connected || busy) return;
-            scanInfo.Text = "Searching... this can take up to 2 minutes.";
+            if (!connected || busy || modemBusy) return;
+            scanInfo.Text = "Searching... this can take up to 2 minutes and cannot be interrupted.";
             DateTime start = DateTime.Now;
             AtResponse resp = null;
             List<NetworkEntry> found;
@@ -1006,7 +1094,9 @@ namespace SWTool
 
             if (resp == null || !resp.Ok)
             {
-                scanInfo.Text = "Search failed: " + (resp != null ? resp.Result : "no response");
+                scanInfo.Text = resp != null && resp.TimedOut
+                    ? "Search failed: the modem did not answer in time and may still be searching."
+                    : "Search failed: " + (resp != null ? resp.Result : "no response");
                 return;
             }
 
@@ -1088,26 +1178,40 @@ namespace SWTool
 
         private async void OnRegisterClick(object sender, EventArgs e)
         {
-            if (!connected || busy || networkList.SelectedItems.Count != 1) return;
+            if (registering)
+            {
+                RequestCancel();
+                return;
+            }
+            if (!connected || busy || modemBusy || networkList.SelectedItems.Count != 1) return;
             NetworkEntry n = networkList.SelectedItems[0].Tag as NetworkEntry;
             if (n == null) return;
             string tech = Parsers.AccessTechnology(n.Act);
             bool wantLock = lockType.Checked && n.Act >= 0;
             string what = n.LongName + " (" + Parsers.FormatPlmn(n.Plmn) + ")";
 
-            // On the EM7455 a manual registration always rewrites the network type preference (!SELRAT):
-            // to the named type only, or to Automatic when no type is named. Say so before doing it.
+            bool sierra = modem.Kind == ModemKind.Sierra;
             string question = "Register manually on " + what + (wantLock ? " using " + tech + " only" : "") + "?\n\n"
                 + "The modem stays on this network until you choose another one or switch back to automatic selection.\n\n";
-            if (wantLock)
+            if (sierra && wantLock)
             {
+                // On the EM7455 a manual registration always rewrites the network type preference (!SELRAT):
+                // to the named type only, or to Automatic when no type is named. Say so before doing it.
                 question += "The modem's network type preference becomes \"" + tech + " only\". It will not fall back to "
                     + "another network type until you change that preference (\"Network type\" below).";
             }
-            else
+            else if (sierra)
             {
                 question += "The modem picks the network type on this operator itself: its network type preference "
                     + "is reset to \"Automatic\".";
+            }
+            else if (wantLock)
+            {
+                question += "The modem is told to use " + tech + " on this operator and does not switch to another network type there.";
+            }
+            else
+            {
+                question += "The modem picks the network type on this operator itself, following its network type preference.";
             }
             question += "\n\nThe data connection is briefly interrupted and usually comes back with a new IP address.";
             if (n.Stat == 3) question += "\n\nThis network is marked as forbidden for your SIM card, so the registration will probably be rejected.";
@@ -1115,8 +1219,10 @@ namespace SWTool
                 n.Stat == 3 ? MessageBoxIcon.Warning : MessageBoxIcon.Question) != DialogResult.OK) return;
 
             RegisterResult res;
+            registering = true;
             try
             {
+                // Some modems take over a minute to give up on a network that refuses the SIM.
                 res = await RunBusy("Registering on " + n.LongName + "...",
                     delegate { return modem.Register(n.Plmn, n.Act, wantLock); });
             }
@@ -1124,6 +1230,11 @@ namespace SWTool
             {
                 if (!closing) ConnectionLost(ex);
                 return;
+            }
+            finally
+            {
+                registering = false;
+                if (!closing) UpdateEnabled();
             }
             if (closing) return;
 
@@ -1133,17 +1244,74 @@ namespace SWTool
                 return;
             }
 
-            // A network that refuses the SIM never answers the command; it is then cancelled by the modem layer.
-            string reason = res.Response.TimedOut
-                ? "The network did not accept the registration in time, which usually means that roaming is not permitted "
-                    + "there for this SIM card."
+            string outcome = res.StillPending ? "The modem is still working on the command; its port stays busy until it answers."
+                : res.OperatorSelected ? "It now uses whichever network type this operator offers."
+                : res.Reverted ? "The modem returns to its previous network."
+                : "The modem could not be put back on its previous network. Choose a network or use Automatic selection.";
+            if (res.Cancelled && (res.Reverted || res.OperatorSelected))
+            {
+                SetStatus("Registration cancelled. " + outcome);
+                return;
+            }
+
+            // A Sierra modem never answers when the network refuses the SIM; the attempt is then ended for it.
+            string reason = res.Cancelled ? "The registration was cancelled."
+                : res.Response.TimedOut ? "The network did not accept the registration in time, which usually means that roaming "
+                    + "is not permitted there for this SIM card."
                 : "Modem response: " + res.Response.Result;
-            string message = res.OperatorSelected
-                ? "The modem is registered on " + what + ", but it could not be locked to " + tech + ".\n\n" + reason
-                    + "\n\nIt now uses whichever network type this operator offers (preference \"Automatic\")."
-                : "The modem could not register on " + what + ".\n\n" + reason
-                    + (res.Response.TimedOut ? "\n\nThe attempt was cancelled and the modem returns to the previous network." : "");
+            string message = (res.OperatorSelected
+                ? "The modem is registered on " + what + ", but it could not be locked to " + tech + "."
+                : "The modem could not register on " + what + ".") + "\n\n" + reason + "\n\n" + outcome;
             MessageBox.Show(this, message, "SWTool", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+
+        /// <summary>Asks the modem to drop the registration that is running.</summary>
+        private async void RequestCancel()
+        {
+            if (cancelling || closing) return;
+            cancelling = true;
+            UpdateEnabled();
+            try
+            {
+                await Task.Run(() => modem.Cancel());
+            }
+            catch (Exception) { }
+            cancelling = false;
+            if (!closing) UpdateEnabled();
+        }
+
+        /// <summary>Restarts the modem: the way out when it has stopped answering.</summary>
+        private async void OnRestartClick(object sender, EventArgs e)
+        {
+            if (!connected || restarting) return;
+            if (MessageBox.Show(this, "Restart the modem?\n\n"
+                + "This is the software equivalent of unplugging it. The modem disappears for about 15 seconds, "
+                + "a running search or registration ends, and the data connection is interrupted. SWTool reconnects "
+                + "when the modem is back.\n\nUse it when the modem has stopped answering.",
+                "Restart modem", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
+
+            restarting = true;
+            UpdateEnabled();
+            SetStatus("Restarting the modem...");
+            string problem;
+            try
+            {
+                problem = await Task.Run(() => modem.Restart());
+            }
+            catch (Exception ex)
+            {
+                problem = Friendly(ex);
+            }
+            restarting = false;
+            if (closing) return;
+            if (problem != null)
+            {
+                UpdateEnabled();
+                MessageBox.Show(this, problem, "SWTool", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            // The port is about to vanish; close it now and let the retry loop pick the modem up again.
+            ConnectionLost(new IOException("the modem is restarting"));
         }
 
         private async void OnAutomaticClick(object sender, EventArgs e)
@@ -1167,6 +1335,113 @@ namespace SWTool
             shownRat = null;
             await RunCommand("Setting network type preference...", delegate { return modem.SetRatPreference(c.Index); },
                 "The modem rejected the network type preference.");
+        }
+
+        /// <summary>Band chooser for modems that switch bands one by one (Icera).</summary>
+        private async void OnBandsClick(object sender, EventArgs e)
+        {
+            if (!connected || busy || status == null || status.Bands == null) return;
+            List<BandToggle> current = status.Bands;
+            List<BandToggle> wanted = AskBands(current);
+            if (wanted == null) return;
+
+            List<string> on = new List<string>(), off = new List<string>();
+            for (int i = 0; i < current.Count; i++)
+            {
+                if (current[i].Enabled == wanted[i].Enabled) continue;
+                (wanted[i].Enabled ? on : off).Add(wanted[i].Name);
+            }
+            if (on.Count == 0 && off.Count == 0) return;
+
+            string question = "Change the modem's band setting?\n\n"
+                + (on.Count > 0 ? "Switch on:  " + string.Join(", ", on.ToArray()) + "\n" : "")
+                + (off.Count > 0 ? "Switch off:  " + string.Join(", ", off.ToArray()) + "\n" : "")
+                + "\nThe setting is stored in the modem and survives restarts. If none of the remaining bands is "
+                + "available here, the modem has no service until you change it back.";
+            if (MessageBox.Show(this, question, "Bands", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
+
+            AtResponse r;
+            try
+            {
+                r = await RunBusy("Setting bands...", delegate { return modem.SetBands(current, wanted); });
+            }
+            catch (Exception ex)
+            {
+                if (!closing) ConnectionLost(ex);
+                return;
+            }
+            if (closing || r == null) return;
+            if (r.Ok)
+            {
+                SetStatus("Bands changed");
+            }
+            else
+            {
+                MessageBox.Show(this, "The modem rejected a band change.\n\nCommand: " + r.Command + "\n"
+                    + (r.TimedOut ? "The modem did not answer in time." : "Modem response: " + r.Result)
+                    + "\n\nBands changed before this one stay changed; the list below shows the result.",
+                    "SWTool", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
+        /// <summary>Shows the band check list. Returns the wanted state per band, or null if cancelled.</summary>
+        private List<BandToggle> AskBands(List<BandToggle> current)
+        {
+            using (Form dlg = new Form())
+            {
+                dlg.Text = "Bands";
+                dlg.Font = Font;
+                dlg.FormBorderStyle = FormBorderStyle.FixedDialog;
+                dlg.MaximizeBox = dlg.MinimizeBox = false;
+                dlg.ShowInTaskbar = false;
+                dlg.StartPosition = FormStartPosition.CenterParent;
+                dlg.AutoScaleDimensions = new SizeF(96f, 96f);
+                dlg.AutoScaleMode = AutoScaleMode.Dpi;
+                dlg.ClientSize = new Size(320, 330);
+
+                Label hint = new Label();
+                hint.Text = "Bands the modem may use. Bands its hardware does not have are rejected when applied.";
+                hint.SetBounds(12, 10, 296, 34);
+
+                CheckedListBox list = new CheckedListBox();
+                list.CheckOnClick = true;
+                list.IntegralHeight = false;
+                list.SetBounds(12, 48, 296, 232);
+                foreach (BandToggle b in current) list.Items.Add(b, b.Enabled);
+
+                Button ok = new Button();
+                ok.Text = "OK";
+                ok.DialogResult = DialogResult.OK;
+                ok.SetBounds(152, 292, 75, 26);
+                Button cancel = new Button();
+                cancel.Text = "Cancel";
+                cancel.DialogResult = DialogResult.Cancel;
+                cancel.SetBounds(233, 292, 75, 26);
+
+                dlg.Controls.Add(hint);
+                dlg.Controls.Add(list);
+                dlg.Controls.Add(ok);
+                dlg.Controls.Add(cancel);
+                dlg.AcceptButton = ok;
+                dlg.CancelButton = cancel;
+
+                while (true)
+                {
+                    if (dlg.ShowDialog(this) != DialogResult.OK) return null;
+                    if (list.CheckedItems.Count > 0) break;
+                    MessageBox.Show(dlg, "Leave at least one band switched on.", "Bands", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+
+                List<BandToggle> wanted = new List<BandToggle>();
+                for (int i = 0; i < current.Count; i++)
+                {
+                    BandToggle b = new BandToggle();
+                    b.Id = current[i].Id;
+                    b.Enabled = list.GetItemChecked(i);
+                    wanted.Add(b);
+                }
+                return wanted;
+            }
         }
 
         private async void OnBandApplyClick(object sender, EventArgs e)
@@ -1223,8 +1498,18 @@ namespace SWTool
             if (closing) return;
             StringBuilder sb = new StringBuilder();
             sb.Append("> ").AppendLine(r.Command);
-            if (r.Text.Length > 0) sb.AppendLine(r.Text.Replace("\n", "\r\n"));
-            sb.Append(r.Result).Append("   [").Append(r.ElapsedMs).AppendLine(" ms]");
+            if (r.Busy)
+            {
+                sb.Append("NOT SENT: the modem is still working on ").AppendLine(r.Text);
+            }
+            else
+            {
+                if (r.Text.Length > 0) sb.AppendLine(r.Text.Replace("\n", "\r\n"));
+                if (r.TimedOut)
+                    sb.Append("No answer after ").Append(r.ElapsedMs / 1000).AppendLine(" s. If the modem is still working on it, the answer is shown when it arrives.");
+                else
+                    sb.Append(r.Result).Append("   [").Append(r.ElapsedMs).AppendLine(" ms]");
+            }
             sb.AppendLine();
             if (consoleOut.TextLength > 300000) consoleOut.Text = consoleOut.Text.Substring(150000);
             consoleOut.AppendText(sb.ToString());
@@ -1263,8 +1548,9 @@ namespace SWTool
             consoleHistoryPos = consoleHistory.Count;
             consoleIn.Clear();
 
-            // Network searches and registrations answer late; everything else is quick.
-            int timeout = cmd.IndexOf("COPS=", StringComparison.OrdinalIgnoreCase) >= 0 ? 240000 : 15000;
+            // The console never waits longer than this. A command that takes longer (search, registration)
+            // keeps running in the modem; the window shows it as busy and prints the answer when it comes.
+            const int timeout = 15000;
             sending = true;
             UpdateEnabled();
             try

@@ -293,8 +293,13 @@ namespace SWTool
 
         public static void ParseCsq(string text, ModemStatus s)
         {
-            Match m = Regex.Match(text, @"\+CSQ:\s*(\d+)");
+            Match m = Regex.Match(text, @"\+CSQ:\s*(\d+)(?:\s*,\s*(\d+))?");
             if (!m.Success) return;
+            if (m.Groups[2].Success)
+            {
+                int ber = int.Parse(m.Groups[2].Value, Inv);
+                if (ber <= 7) s.Ber = ber;
+            }
             int v = int.Parse(m.Groups[1].Value, Inv);
             if (v > 31) return;
             s.Csq = v;
@@ -317,8 +322,182 @@ namespace SWTool
         /// <summary>Returns the stat field of +CREG / +CGREG / +CEREG, or -1.</summary>
         public static int ParseReg(string text)
         {
-            Match m = Regex.Match(text, @"\+C[EG]?REG:\s*\d+\s*,\s*(\d+)");
-            return m.Success ? int.Parse(m.Groups[1].Value, Inv) : -1;
+            return ParseRegInfo(text).Stat;
+        }
+
+        /// <summary>
+        /// Parses the answer to +CREG? / +CGREG? including the location fields of mode 2:
+        /// "+CGREG: 2,5,"3984","0000EA26",3,"01"" (n, stat, lac, ci, act, rac).
+        /// </summary>
+        public static RegInfo ParseRegInfo(string text)
+        {
+            RegInfo info = new RegInfo();
+            Match m = Regex.Match(text, @"\+C[EG]?REG:\s*\d+\s*,\s*(\d+)"
+                + @"(?:\s*,\s*""?([0-9A-Fa-f]+)""?\s*,\s*""?([0-9A-Fa-f]+)""?(?:\s*,\s*(\d+))?(?:\s*,\s*""?([0-9A-Fa-f]+)""?)?)?");
+            if (!m.Success) return info;
+            info.Stat = int.Parse(m.Groups[1].Value, Inv);
+            long v;
+            if (m.Groups[2].Success && long.TryParse(m.Groups[2].Value, NumberStyles.HexNumber, Inv, out v)) info.Lac = v;
+            if (m.Groups[3].Success && long.TryParse(m.Groups[3].Value, NumberStyles.HexNumber, Inv, out v)) info.Ci = v;
+            if (m.Groups[4].Success) info.Act = int.Parse(m.Groups[4].Value, Inv);
+            if (m.Groups[5].Success) info.Rac = m.Groups[5].Value.ToUpperInvariant();
+            return info;
+        }
+
+        /// <summary>"3984 (14724)": hexadecimal as the network counts it, decimal as most tools show it.</summary>
+        public static string HexDec(long value, int hexDigits)
+        {
+            return value.ToString("X" + hexDigits, Inv) + " (" + value.ToString(Inv) + ")";
+        }
+
+        /// <summary>Name of the refinement an access technology number implies, or null.</summary>
+        public static string SubTechOf(int act)
+        {
+            switch (act)
+            {
+                case 3: return "EDGE";
+                case 4: return "HSDPA";
+                case 5: return "HSUPA";
+                case 6: return "HSPA";
+                default: return null;
+            }
+        }
+
+        /// <summary>Decodes EF-ICCID as returned by AT+CRSM=176,12258,0,0,10 (digits are nibble swapped).</summary>
+        public static string ParseIccidFile(string text)
+        {
+            Match m = Regex.Match(text, @"\+CRSM:\s*144\s*,\s*\d+\s*,\s*""?([0-9A-Fa-f]{18,20})""?");
+            if (!m.Success) return null;
+            string raw = m.Groups[1].Value.ToUpperInvariant();
+            System.Text.StringBuilder sb = new System.Text.StringBuilder();
+            for (int i = 0; i + 1 < raw.Length; i += 2) sb.Append(raw[i + 1]).Append(raw[i]);
+            string digits = sb.ToString().TrimEnd('F');
+            return Regex.IsMatch(digits, @"^\d{18,20}$") ? digits : null;
+        }
+
+        // ------------------------------------------------------------------ Icera (%-commands)
+
+        /// <summary>"%NWSTATE: 4,22288,2G-EDGE,-,0": signal bars, PLMN, technology, HSPA state, extra.</summary>
+        public static bool ParseNwState(string text, ModemStatus s)
+        {
+            Match m = Regex.Match(text, @"%I?NWSTATE:\s*(\d+)\s*,\s*(\d*)\s*,\s*([^,\n]*),\s*([^,\n]*)");
+            if (!m.Success) return false;
+            string tech = m.Groups[3].Value.Trim();
+            string upper = tech.ToUpperInvariant();
+            if (upper.StartsWith("2G", StringComparison.Ordinal)) s.SystemMode = "GSM";
+            else if (upper.StartsWith("3G", StringComparison.Ordinal)) s.SystemMode = "WCDMA";
+
+            if (upper.Contains("HSPA+")) s.SubTech = "HSPA+";
+            else if (upper.Contains("HSPA") || (upper.Contains("HSDPA") && upper.Contains("HSUPA"))) s.SubTech = "HSPA";
+            else if (upper.Contains("HSDPA")) s.SubTech = "HSDPA";
+            else if (upper.Contains("HSUPA")) s.SubTech = "HSUPA";
+            else if (upper.Contains("EDGE")) s.SubTech = "EDGE";
+            else if (upper.Contains("GPRS")) s.SubTech = "GPRS";
+
+            // "00000" is reported while the modem is not on any network.
+            string plmn = m.Groups[2].Value;
+            if (plmn.Length >= 5 && plmn.Trim('0').Length > 0 && string.IsNullOrEmpty(s.Plmn)) s.Plmn = plmn;
+            s.Details.Add(new KeyValuePair<string, string>("Technology", tech.Length > 0 && tech != "-" ? tech : "none"));
+            s.Details.Add(new KeyValuePair<string, string>("Signal bars (modem's own rating)", m.Groups[1].Value + " of 5"));
+            string hs = m.Groups[4].Value.Trim();
+            if (hs.Length > 0 && hs != "-") s.Details.Add(new KeyValuePair<string, string>("Connection state", hs));
+            return true;
+        }
+
+        /// <summary>"%ICSQ: 2G-RSSI= -63 dBm" on GSM; RSCP and Ec/N0 values on UMTS.</summary>
+        public static void ParseIcsq(string text, ModemStatus s)
+        {
+            Match line = Regex.Match(text, @"%ICSQ:\s*(.+)");
+            if (!line.Success) return;
+            s.Details.Add(new KeyValuePair<string, string>("Signal measurement (%ICSQ)", line.Groups[1].Value.Trim()));
+            foreach (Match m in Regex.Matches(line.Groups[1].Value, @"(RSSI|RSCP|EC\s*/?\s*N0|EC\s*/?\s*IO)\s*[=:]\s*(-?\d+(?:\.\d+)?)",
+                RegexOptions.IgnoreCase))
+            {
+                double v = double.Parse(m.Groups[2].Value, Inv);
+                string name = m.Groups[1].Value.ToUpperInvariant();
+                if (name == "RSSI") { if (v < 0) s.Rssi = v; }
+                else if (name == "RSCP") { if (v < 0) s.Rscp = v; }
+                else if (v <= 0) s.Ecio = v;
+            }
+        }
+
+        /// <summary>
+        /// "%INCELL: 3,6,965012009,53,964952064,38,...": count, then pairs of cell identity and receive
+        /// level, strongest first. The identity is (LAC * 65536 + cell ID); the cell ID part stays 0
+        /// until the modem has read that cell's system information.
+        /// </summary>
+        public static void ParseIncell(string text, ModemStatus s, long? servingLac, long? servingCi)
+        {
+            Match m = Regex.Match(text, @"%INCELL:\s*(\d+)\s*,\s*(\d+)((?:\s*,\s*\d+)*)");
+            if (!m.Success) return;
+            string[] v = m.Groups[3].Value.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+            for (int i = 0; i + 1 < v.Length; i += 2)
+            {
+                long id, level;
+                if (!long.TryParse(v[i].Trim(), out id) || !long.TryParse(v[i + 1].Trim(), out level)) continue;
+                long lac = id >> 16, ci = id & 0xFFFF;
+                if (servingCi.HasValue && ci == servingCi.Value && lac == (servingLac ?? lac)) continue; // shown as serving cell
+
+                CellInfo c = new CellInfo();
+                c.Kind = s.IsWcdma ? "Measured cell" : "Measured GSM cell";
+                c.Id = ci != 0 ? ci.ToString(Inv) : "(not read yet)";
+                c.Area = lac != 0 ? lac.ToString(Inv) : "";
+                // GSM receive level: 0..63 maps to -110..-47 dBm.
+                c.Level = s.IsWcdma ? level.ToString(Inv) : (level - 110).ToString(Inv);
+                s.Cells.Add(c);
+            }
+        }
+
+        /// <summary>Parses the band switches of AT%IPBM?: one line per band, "EGSM": 1.</summary>
+        public static List<BandToggle> ParseIpbm(string text)
+        {
+            List<BandToggle> list = new List<BandToggle>();
+            foreach (Match m in Regex.Matches(text, @"""([A-Za-z0-9_]+)""\s*:\s*([01])"))
+            {
+                BandToggle b = new BandToggle();
+                b.Id = m.Groups[1].Value;
+                b.Enabled = m.Groups[2].Value == "1";
+                list.Add(b);
+            }
+            return list;
+        }
+
+        /// <summary>Expands a 3GPP style value list such as "(0-3,5)" into its members.</summary>
+        public static List<int> ParseRange(string group)
+        {
+            List<int> list = new List<int>();
+            foreach (string part in group.Trim('(', ')', ' ').Split(','))
+            {
+                Match m = Regex.Match(part, @"^\s*(\d+)(?:\s*-\s*(\d+))?\s*$");
+                if (!m.Success) continue;
+                int from = int.Parse(m.Groups[1].Value, Inv);
+                int to = m.Groups[2].Success ? int.Parse(m.Groups[2].Value, Inv) : from;
+                for (int i = from; i <= to && i - from < 64; i++) list.Add(i);
+            }
+            return list;
+        }
+
+        // ------------------------------------------------------------------ packet data (standard commands)
+
+        /// <summary>APN of a context from +CGDCONT? ("+CGDCONT: 1,"IP","internet",...").</summary>
+        public static string ApnOfContext(string cgdcont, string cid)
+        {
+            Match m = Regex.Match(cgdcont, @"\+CGDCONT:\s*" + Regex.Escape(cid) + @"\s*,\s*""[^""]*""\s*,\s*""([^""]*)""");
+            return m.Success ? m.Groups[1].Value : null;
+        }
+
+        /// <summary>First context reported as active by +CGACT? or %IPDPACT? ("...: cid,1").</summary>
+        public static string ActiveContext(string text)
+        {
+            Match m = Regex.Match(text, @"(?:\+CGACT|%IPDPACT):\s*(\d+)\s*,\s*1\b");
+            return m.Success ? m.Groups[1].Value : null;
+        }
+
+        /// <summary>IPv4 address of a context from +CGPADDR or %IPDPADDR ("...: cid,a.b.c.d,...").</summary>
+        public static string AddressOfContext(string text, string cid)
+        {
+            Match m = Regex.Match(text, @"(?:\+CGPADDR|%IPDPADDR):\s*" + Regex.Escape(cid) + @"\s*,\s*""?(\d+\.\d+\.\d+\.\d+)""?");
+            return m.Success && m.Groups[1].Value != "0.0.0.0" ? m.Groups[1].Value : null;
         }
 
         /// <summary>+CGCONTRDP: cid,bearer,apn,ipv4,ipv6,... (addresses in dotted decimal).</summary>
@@ -359,7 +538,7 @@ namespace SWTool
                 Match m = Regex.Match(line, @"^\s*(?:![A-Z]+:\s*)?([0-9A-Fa-f]{1,2})\s*,\s*(.+?)\s*$");
                 if (!m.Success) continue;
                 // Some firmware versions append the band masks after the name.
-                string name = Regex.Replace(m.Groups[2].Value, @"\s{2,}[0-9A-Fa-f]{8,}.*$", "").Trim();
+                string name = Regex.Replace(m.Groups[2].Value, @"[,\s]+[0-9A-Fa-f]{8,}.*$", "").Trim().TrimEnd(',').Trim();
                 if (name.Length == 0 || name.IndexOf("Not Supported", StringComparison.OrdinalIgnoreCase) >= 0) continue;
                 Choice c = new Choice();
                 c.Index = m.Groups[1].Value.ToUpperInvariant().PadLeft(2, '0');
